@@ -232,6 +232,7 @@ fn kv_event_create_stored_block_from_parts(
         kv_block_size,
         BlockHashOptions {
             lora_name,
+            cache_namespace: None,
             ..Default::default()
         },
     )[0];
@@ -456,6 +457,7 @@ impl RouterHandles {
         tokens: &[u32],
         block_mm_infos: Option<&[Option<dynamo_kv_router::protocols::BlockExtraInfo>]>,
         lora_name: Option<String>,
+        cache_namespace: Option<String>,
         priority_jump: f64,
         strict_priority: u32,
         allowed_worker_ids: Option<HashSet<WorkerId>>,
@@ -471,6 +473,7 @@ impl RouterHandles {
                 tokens,
                 block_mm_infos,
                 lora_name,
+                cache_namespace,
                 priority_jump,
                 strict_priority,
                 allowed_worker_ids,
@@ -511,10 +514,12 @@ impl RouterHandles {
     /// selection. State updates require a `context_id` (request id) and are managed via the
     /// explicit bookkeeping APIs (`add_request`, `mark_prefill_complete`, `free_request`).
     /// Returns (worker, overlap_blocks) on success.
+    #[expect(clippy::too_many_arguments)]
     async fn query_decode_worker(
         &self,
         tokens: &[u32],
         is_disaggregated: bool,
+        cache_namespace: Option<String>,
         priority_jump: f64,
         strict_priority: u32,
         allowed_worker_ids: Option<HashSet<WorkerId>>,
@@ -547,6 +552,7 @@ impl RouterHandles {
                 false,
                 false,
                 None,
+                cache_namespace,
                 priority_jump,
                 strict_priority,
                 None,
@@ -607,6 +613,15 @@ fn extract_strict_priority(
         .and_then(|n| n.agent_hints.as_ref())
         .and_then(|h| h.strict_priority)
         .unwrap_or(0)
+}
+
+fn extract_cache_namespace(
+    request: &dynamo_llm::types::openai::chat_completions::NvCreateChatCompletionRequest,
+) -> Option<String> {
+    request
+        .nvext
+        .as_ref()
+        .and_then(|nvext| nvext.cache_salt.clone())
 }
 
 /// Opaque handle for the router pair
@@ -905,7 +920,7 @@ pub unsafe extern "C" fn add_request(
 
             // Compute overlap_blocks using the public method
             let overlap_blocks = match decode_router
-                .get_overlap_blocks(&tokens, None, worker, None)
+                .get_overlap_blocks(&tokens, None, worker, None, None)
                 .await
             {
                 Ok(overlap) => overlap,
@@ -925,6 +940,7 @@ pub unsafe extern "C" fn add_request(
                     None,
                     worker,
                     None, // lora_name
+                    None, // cache_namespace
                     Some(&router_config_override),
                 )
                 .await;
@@ -1113,10 +1129,12 @@ pub unsafe extern "C" fn free_routing_result(result: *mut CRoutingResult) {
 /// absent. This mirrors the standalone Dynamo preprocessor lift in
 /// `lib/llm/src/preprocessor.rs` so the GAIE/EPP path produces the same queue
 /// ordering as a non-EPP deployment.
+type PreprocessedRequest = (Vec<u32>, Option<String>, f64, u32, RoutingConstraints);
+
 unsafe fn preprocess_request(
     handles: &RouterHandles,
     request_json: *const c_char,
-) -> Result<(Vec<u32>, f64, u32, RoutingConstraints), QueryRouterResult> {
+) -> Result<PreprocessedRequest, QueryRouterResult> {
     let preprocessor = match &handles.preprocessor {
         Some(p) => p,
         None => {
@@ -1141,6 +1159,7 @@ unsafe fn preprocess_request(
 
     let priority_jump = extract_priority_jump(&request);
     let strict_priority = extract_strict_priority(&request);
+    let cache_namespace = extract_cache_namespace(&request);
     let routing_constraints = request
         .nvext
         .as_ref()
@@ -1176,6 +1195,7 @@ unsafe fn preprocess_request(
 
     Ok((
         token_ids,
+        cache_namespace,
         priority_jump,
         strict_priority,
         routing_constraints,
@@ -1265,7 +1285,7 @@ pub unsafe extern "C" fn route_prefill_request(
 
     let handles = unsafe { &*handle };
 
-    let (tokens, priority_jump, strict_priority, routing_constraints) =
+    let (tokens, cache_namespace, priority_jump, strict_priority, routing_constraints) =
         match unsafe { preprocess_request(handles, request_json) } {
             Ok(t) => t,
             Err(code) => return code,
@@ -1279,6 +1299,7 @@ pub unsafe extern "C" fn route_prefill_request(
                 &tokens,
                 None,
                 None,
+                cache_namespace,
                 priority_jump,
                 strict_priority,
                 allowed_worker_ids,
@@ -1346,7 +1367,7 @@ pub unsafe extern "C" fn route_decode_request(
 
     let handles = unsafe { &*handle };
 
-    let (tokens, priority_jump, strict_priority, routing_constraints) =
+    let (tokens, cache_namespace, priority_jump, strict_priority, routing_constraints) =
         match unsafe { preprocess_request(handles, request_json) } {
             Ok(t) => t,
             Err(code) => return code,
@@ -1359,6 +1380,7 @@ pub unsafe extern "C" fn route_decode_request(
             .query_decode_worker(
                 &tokens,
                 is_disaggregated,
+                cache_namespace,
                 priority_jump,
                 strict_priority,
                 allowed_worker_ids,
