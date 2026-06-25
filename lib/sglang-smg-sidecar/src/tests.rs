@@ -540,7 +540,6 @@ fn validate_rejects_disaggregated_handoff_fields() {
         bootstrap_port: 12345,
         bootstrap_room: 9_223_372_036_854_775_000,
     });
-    });
     let err = validate_supported_request(&req).expect_err("bootstrap_info unsupported");
     assert_invalid_arg(err);
 
