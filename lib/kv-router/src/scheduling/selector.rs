@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use rand::Rng;
 use rustc_hash::FxHashMap;
 
-use super::config::KvRouterConfig;
+use super::config::{KvRouterConfig, RouterWorkerSelectionPolicy};
 use super::filter::{RoutingEligibility, WorkerEligibilityError};
 use super::types::{KvSchedulerError, SchedulingRequest};
 use crate::protocols::{WorkerConfigLike, WorkerId, WorkerSelectionResult, WorkerWithDpRank};
@@ -236,6 +236,59 @@ impl DefaultWorkerSelector {
 
         logit
     }
+
+    fn prefill_token_balance_logit(
+        &self,
+        request: &SchedulingRequest,
+        worker: WorkerWithDpRank,
+    ) -> f64 {
+        let worker_load = request.worker_load_for(worker);
+        let cached_tokens = request.effective_cached_tokens_for(worker);
+        let incoming_prefill_tokens =
+            super::prefill_load::effective_prefill_tokens(request.isl_tokens, cached_tokens);
+        let projected_prefill_tokens = worker_load
+            .active_prefill_tokens
+            .saturating_add(incoming_prefill_tokens);
+        let logit = projected_prefill_tokens as f64;
+
+        tracing::debug!(
+            "Prefill token balance formula for worker_id={} dp_rank={:?}: {logit:.3} \
+             = active_prefill_tokens + incoming_effective_prefill_tokens \
+             = {} + {} (isl_tokens: {}, cached_tokens: {})",
+            worker.worker_id,
+            worker.dp_rank,
+            worker_load.active_prefill_tokens,
+            incoming_prefill_tokens,
+            request.isl_tokens,
+            cached_tokens
+        );
+
+        logit
+    }
+
+    fn selection_logit(
+        &self,
+        request: &SchedulingRequest,
+        worker: WorkerWithDpRank,
+        block_size: u32,
+        min_active_prefill_tokens: usize,
+        weights: LogitWeights,
+        formula_name: &'static str,
+    ) -> f64 {
+        match self.kv_router_config.router_worker_selection_policy {
+            RouterWorkerSelectionPolicy::Default => self.worker_logit(
+                request,
+                worker,
+                block_size,
+                min_active_prefill_tokens,
+                weights,
+                formula_name,
+            ),
+            RouterWorkerSelectionPolicy::PrefillTokenBalance => {
+                self.prefill_token_balance_logit(request, worker)
+            }
+        }
+    }
 }
 
 impl<C: WorkerConfigLike> WorkerSelector<C> for DefaultWorkerSelector {
@@ -302,7 +355,7 @@ impl<C: WorkerConfigLike> WorkerSelector<C> for DefaultWorkerSelector {
             }
 
             let min_active_prefill_tokens = request.worker_load_for(worker).active_prefill_tokens;
-            let logit = self.worker_logit(
+            let logit = self.selection_logit(
                 request,
                 worker,
                 block_size,
@@ -347,7 +400,7 @@ impl<C: WorkerConfigLike> WorkerSelector<C> for DefaultWorkerSelector {
                 0
             };
         let get_score = |worker: WorkerWithDpRank| -> f64 {
-            let base_score = self.worker_logit(
+            let base_score = self.selection_logit(
                 request,
                 worker,
                 block_size,
@@ -425,6 +478,7 @@ impl<C: WorkerConfigLike> WorkerSelector<C> for DefaultWorkerSelector {
                 worker_id = best_worker.worker_id,
                 worker_type = %self.worker_type,
                 dp_rank = ?best_worker.dp_rank,
+                selection_policy = %self.kv_router_config.router_worker_selection_policy,
                 logit = best_logit,
                 host_pinned_blocks = best_host_pinned_overlap_blocks,
                 disk_blocks = best_disk_overlap_blocks,
@@ -453,6 +507,7 @@ impl<C: WorkerConfigLike> WorkerSelector<C> for DefaultWorkerSelector {
             worker_id = best_worker.worker_id,
             worker_type = %self.worker_type,
             dp_rank = ?best_worker.dp_rank,
+            selection_policy = %self.kv_router_config.router_worker_selection_policy,
             logit = best_logit,
             effective_cached_blocks = best_overlap,
             host_pinned_blocks = best_host_pinned_overlap_blocks,
@@ -543,6 +598,23 @@ mod tests {
                     worker,
                     crate::sequences::WorkerLoadProjection {
                         active_decode_blocks,
+                        ..Default::default()
+                    },
+                )
+            })
+            .collect()
+    }
+
+    fn worker_loads_with_active_prefill(
+        prefill_tokens: FxHashMap<WorkerWithDpRank, usize>,
+    ) -> FxHashMap<WorkerWithDpRank, crate::sequences::WorkerLoadProjection> {
+        prefill_tokens
+            .into_iter()
+            .map(|(worker, active_prefill_tokens)| {
+                (
+                    worker,
+                    crate::sequences::WorkerLoadProjection {
+                        active_prefill_tokens,
                         ..Default::default()
                     },
                 )
@@ -716,6 +788,165 @@ mod tests {
         assert!(
             selected_count > 1,
             "zero-temperature tie-breaking should not always select the same worker"
+        );
+    }
+
+    #[test]
+    fn test_default_worker_selection_policy_preserves_cache_cost_behavior() {
+        use crate::test_utils::SimpleWorkerConfig;
+
+        let block_size = 16u32;
+        let warm_worker = WorkerWithDpRank::from_worker_id(0);
+        let cold_worker = WorkerWithDpRank::from_worker_id(1);
+        let workers = HashMap::from([
+            (warm_worker.worker_id, SimpleWorkerConfig::default()),
+            (cold_worker.worker_id, SimpleWorkerConfig::default()),
+        ]);
+        let selector = DefaultWorkerSelector::new(
+            Some(KvRouterConfig {
+                router_worker_selection_policy: RouterWorkerSelectionPolicy::Default,
+                router_temperature: 0.0,
+                ..Default::default()
+            }),
+            "test",
+        );
+        let mut request = base_request(128);
+        request
+            .overlap
+            .effective_cached_tokens
+            .insert(warm_worker, 128);
+        request
+            .overlap
+            .tier_overlap_blocks
+            .device
+            .insert(warm_worker, 8);
+
+        let result = selector
+            .select_worker(&workers, &request, request.eligibility(), block_size)
+            .unwrap();
+
+        assert_eq!(result.worker, warm_worker);
+    }
+
+    #[test]
+    fn test_prefill_token_balance_prefers_lower_projected_prefill_tokens() {
+        use crate::test_utils::SimpleWorkerConfig;
+
+        let block_size = 16u32;
+        let warm_worker = WorkerWithDpRank::from_worker_id(0);
+        let cold_worker = WorkerWithDpRank::from_worker_id(1);
+        let workers = HashMap::from([
+            (warm_worker.worker_id, SimpleWorkerConfig::default()),
+            (cold_worker.worker_id, SimpleWorkerConfig::default()),
+        ]);
+        let selector = DefaultWorkerSelector::new(
+            Some(KvRouterConfig {
+                router_worker_selection_policy: RouterWorkerSelectionPolicy::PrefillTokenBalance,
+                router_temperature: 0.0,
+                ..Default::default()
+            }),
+            "test",
+        );
+        let mut request = base_request(128);
+        request
+            .overlap
+            .effective_cached_tokens
+            .insert(warm_worker, 128);
+        request
+            .overlap
+            .tier_overlap_blocks
+            .device
+            .insert(warm_worker, 8);
+        let mut prefill_tokens = FxHashMap::default();
+        prefill_tokens.insert(warm_worker, 256);
+        prefill_tokens.insert(cold_worker, 0);
+        request.worker_loads = worker_loads_with_active_prefill(prefill_tokens);
+
+        let result = selector
+            .select_worker(&workers, &request, request.eligibility(), block_size)
+            .unwrap();
+
+        assert_eq!(result.worker, cold_worker);
+    }
+
+    #[test]
+    fn test_prefill_token_balance_cached_tokens_reduce_incoming_cost() {
+        use crate::test_utils::SimpleWorkerConfig;
+
+        let block_size = 16u32;
+        let partially_cached_worker = WorkerWithDpRank::from_worker_id(0);
+        let cold_worker = WorkerWithDpRank::from_worker_id(1);
+        let workers = HashMap::from([
+            (
+                partially_cached_worker.worker_id,
+                SimpleWorkerConfig::default(),
+            ),
+            (cold_worker.worker_id, SimpleWorkerConfig::default()),
+        ]);
+        let selector = DefaultWorkerSelector::new(
+            Some(KvRouterConfig {
+                router_worker_selection_policy: RouterWorkerSelectionPolicy::PrefillTokenBalance,
+                router_temperature: 0.0,
+                ..Default::default()
+            }),
+            "test",
+        );
+        let mut request = base_request(128);
+        request
+            .overlap
+            .effective_cached_tokens
+            .insert(partially_cached_worker, 64);
+        request
+            .overlap
+            .tier_overlap_blocks
+            .device
+            .insert(partially_cached_worker, 4);
+        let mut prefill_tokens = FxHashMap::default();
+        prefill_tokens.insert(partially_cached_worker, 32);
+        prefill_tokens.insert(cold_worker, 0);
+        request.worker_loads = worker_loads_with_active_prefill(prefill_tokens);
+
+        let result = selector
+            .select_worker(&workers, &request, request.eligibility(), block_size)
+            .unwrap();
+
+        assert_eq!(result.worker, partially_cached_worker);
+    }
+
+    #[test]
+    fn test_prefill_token_balance_randomizes_exact_score_ties() {
+        use crate::test_utils::SimpleWorkerConfig;
+
+        let config = KvRouterConfig {
+            router_worker_selection_policy: RouterWorkerSelectionPolicy::PrefillTokenBalance,
+            router_temperature: 0.0,
+            ..Default::default()
+        };
+        let selector = DefaultWorkerSelector::new(Some(config), "test");
+        let workers = HashMap::from([
+            (10, SimpleWorkerConfig::default()),
+            (20, SimpleWorkerConfig::default()),
+            (30, SimpleWorkerConfig::default()),
+        ]);
+        let request = base_request(16);
+        let mut selected = [false; 3];
+
+        for _ in 0..120 {
+            let result = selector
+                .select_worker(&workers, &request, request.eligibility(), 16)
+                .unwrap();
+            match result.worker.worker_id {
+                10 => selected[0] = true,
+                20 => selected[1] = true,
+                30 => selected[2] = true,
+                worker_id => panic!("unexpected worker id: {worker_id}"),
+            }
+        }
+
+        let selected_count = selected.into_iter().filter(|seen| *seen).count();
+        assert!(
+            selected_count > 1,
+            "prefill-token-balance exact ties should keep randomized tie-breaking"
         );
     }
 
