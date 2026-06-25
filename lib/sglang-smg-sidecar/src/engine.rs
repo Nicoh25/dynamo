@@ -654,7 +654,7 @@ fn unsupported(feature: &str) -> DynamoError {
 
 pub(crate) fn build_generate_request(
     request: &PreprocessedRequest,
-    _request_id: &str,
+    request_id: &str,
     _metadata: &RuntimeMetadata,
 ) -> Result<(pb::GenerateRequest, Option<serde_json::Value>), DynamoError> {
     validate_supported_request(request)?;
