@@ -393,7 +393,7 @@ async fn from_args_rejects_prefill_server_info() {
         ..FakeConfig::default()
     });
     let endpoint = handle.endpoint.clone();
-    let err = std::thread::spawn(move || {
+    let result = std::thread::spawn(move || {
         SglangSmgSidecarEngine::from_args(Some(vec![
             "dynamo-sglang-smg-sidecar".to_string(),
             "--smg-endpoint".to_string(),
@@ -403,10 +403,12 @@ async fn from_args_rejects_prefill_server_info() {
         ]))
     })
     .join()
-    .expect("from_args thread")
-    .expect_err("prefill role should fail");
+    .expect("from_args thread");
 
-    assert_invalid_arg(err);
+    match result {
+        Ok(_) => panic!("prefill role should fail"),
+        Err(err) => assert_invalid_arg(err),
+    }
 }
 
 #[tokio::test]
