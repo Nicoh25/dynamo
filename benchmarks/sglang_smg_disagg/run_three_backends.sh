@@ -142,7 +142,7 @@ run_smg_disagg() {
     local common=()
     while IFS= read -r -d '' arg; do common+=("$arg"); done < <(sglang_common_args)
 
-    CUDA_VISIBLE_DEVICES=0 \
+    SGLANG_GRPC_TOKEN_ID_ARRAY=1 CUDA_VISIBLE_DEVICES=0 \
         setsid "$PYTHON_BIN" -m sglang.launch_server \
         --grpc-mode \
         "${common[@]}" \
@@ -160,7 +160,7 @@ run_smg_disagg() {
         >>"$server_log" 2>&1 &
     cleanup_pids+=("$!")
 
-    CUDA_VISIBLE_DEVICES=1 \
+    SGLANG_GRPC_TOKEN_ID_ARRAY=1 CUDA_VISIBLE_DEVICES=1 \
         setsid "$PYTHON_BIN" -m sglang.launch_server \
         --grpc-mode \
         "${common[@]}" \

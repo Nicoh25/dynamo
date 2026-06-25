@@ -61,7 +61,7 @@ print_launch_banner "Launching SGLang SMG Sidecar Aggregated Serving (1 GPU)" "$
 
 "$PYTHON_BIN" -m dynamo.frontend &
 
-"$PYTHON_BIN" -m sglang.launch_server \
+SGLANG_GRPC_TOKEN_ID_ARRAY=1 "$PYTHON_BIN" -m sglang.launch_server \
     --grpc-mode \
     --model-path "$MODEL" \
     --served-model-name "$MODEL" \

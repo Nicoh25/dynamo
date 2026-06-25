@@ -36,6 +36,9 @@ spec:
         containers:
           - name: sglang-engine
             image: my-registry/sglang-runtime:my-tag
+            env:
+              - name: SGLANG_GRPC_TOKEN_ID_ARRAY
+                value: "1"
             command:
               - python3
               - -m
