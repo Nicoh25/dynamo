@@ -12,9 +12,8 @@
 # The SGLang environment must include the optional gRPC dependencies:
 #   pip install 'smg-grpc-servicer[sglang]>=0.5.2'
 #
-# v1 supports aggregated serving and SGLang disaggregated prefill/decode handoff.
-# KV-aware routing remains disabled because upstream SMG does not expose KV event
-# sources or rank load metrics.
+# v1 supports aggregated serving. KV-aware routing remains disabled because
+# upstream SMG does not expose KV event sources or rank load metrics.
 
 set -e
 trap 'echo Cleaning up...; kill 0' EXIT
@@ -52,7 +51,6 @@ done
 GPU_MEM_ARGS=$(build_sglang_gpu_mem_args)
 
 SGLANG_HOST="${SGLANG_HOST:-127.0.0.1}"
-SGLANG_HTTP_PORT="${SGLANG_HTTP_PORT:-30000}"
 SMG_PORT="${SMG_PORT:-40000}"
 SMG_CONNECTIONS="${SMG_CONNECTIONS:-1}"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
@@ -63,13 +61,12 @@ print_launch_banner "Launching SGLang SMG Sidecar Aggregated Serving (1 GPU)" "$
 
 "$PYTHON_BIN" -m dynamo.frontend &
 
-SGLANG_GRPC_PORT="$SMG_PORT" \
 "$PYTHON_BIN" -m sglang.launch_server \
     --grpc-mode \
     --model-path "$MODEL" \
     --served-model-name "$MODEL" \
     --host "$SGLANG_HOST" \
-    --port "$SGLANG_HTTP_PORT" \
+    --port "$SMG_PORT" \
     --tp 1 \
     --trust-remote-code \
     --disable-cuda-graph \

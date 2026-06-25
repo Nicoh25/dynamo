@@ -387,36 +387,30 @@ async fn smg_sidecar_passes_conformance() {
 }
 
 #[tokio::test]
-async fn from_args_builds_prefill_worker_config_from_server_info() {
+async fn from_args_rejects_prefill_server_info() {
     let handle = spawn_fake_engine(FakeConfig {
         role: "prefill".to_string(),
         ..FakeConfig::default()
     });
     let endpoint = handle.endpoint.clone();
-    let cfg = std::thread::spawn(move || {
-        let (_engine, cfg) = SglangSmgSidecarEngine::from_args(Some(vec![
+    let err = std::thread::spawn(move || {
+        SglangSmgSidecarEngine::from_args(Some(vec![
             "dynamo-sglang-smg-sidecar".to_string(),
             "--smg-endpoint".to_string(),
             endpoint,
             "--endpoint-types".to_string(),
             "chat".to_string(),
         ]))
-        .expect("from_args");
-        cfg
     })
     .join()
-    .expect("from_args thread");
+    .expect("from_args thread")
+    .expect_err("prefill role should fail");
 
-    assert_eq!(cfg.component, "prefill");
-    assert_eq!(cfg.disaggregation_mode, DisaggregationMode::Prefill);
-    assert_eq!(cfg.model_name, "fake-model");
-    assert_eq!(cfg.served_model_name.as_deref(), Some("fake-served"));
-    assert_eq!(cfg.endpoint_types, "chat");
-    assert!(!cfg.enable_kv_routing);
+    assert_invalid_arg(err);
 }
 
 #[tokio::test]
-async fn start_advertises_prefill_metadata() {
+async fn start_rejects_prefill_mode() {
     let handle = spawn_fake_engine(FakeConfig {
         role: "prefill".to_string(),
         data_parallel_size: 2,
@@ -426,35 +420,9 @@ async fn start_advertises_prefill_metadata() {
     });
     let engine = engine_for(&handle, DisaggregationMode::Prefill);
 
-    let cfg = engine.start(0).await.expect("start");
-    assert_eq!(cfg.model, "fake-model");
-    assert_eq!(cfg.served_model_name.as_deref(), Some("fake-served"));
-    let llm = cfg.llm.as_ref().expect("llm registration");
-    assert_eq!(llm.context_length, Some(4096));
-    assert_eq!(llm.kv_cache_block_size, Some(16));
-    assert_eq!(llm.total_kv_blocks, Some(2048));
-    assert_eq!(llm.max_num_seqs, Some(128));
-    assert_eq!(llm.max_num_batched_tokens, Some(8192));
-    assert_eq!(llm.data_parallel_size, Some(2));
-    assert_eq!(llm.bootstrap_host.as_deref(), Some("10.0.0.7"));
-    assert_eq!(llm.bootstrap_port, Some(34567));
-
-    engine.cleanup().await.unwrap();
-}
-
-#[tokio::test]
-async fn disaggregated_start_uses_metadata_readiness_not_smg_healthcheck() {
-    let handle = spawn_fake_engine(FakeConfig {
-        role: "prefill".to_string(),
-        healthy: false,
-        ..FakeConfig::default()
-    });
-    let engine = engine_for(&handle, DisaggregationMode::Prefill);
-
-    engine.start(0).await.expect("metadata readiness");
+    let err = engine.start(0).await.expect_err("prefill role should fail");
+    assert_invalid_arg(err);
     assert_eq!(handle.health_count.load(Ordering::SeqCst), 0);
-
-    engine.cleanup().await.unwrap();
 }
 
 #[tokio::test]
@@ -470,7 +438,7 @@ async fn start_rejects_role_change_after_bootstrap() {
 }
 
 // ============================================================================
-// Generate happy path + disaggregated handoff
+// Generate happy path + unsupported aggregate features
 // ============================================================================
 
 #[tokio::test]
@@ -564,65 +532,17 @@ async fn generate_maps_request_and_streams_tokens_then_stop_terminal() {
     engine.cleanup().await.unwrap();
 }
 
-#[tokio::test]
-async fn prefill_suppresses_tokens_and_returns_disagg_terminal() {
-    let handle = spawn_fake_engine(FakeConfig {
-        role: "prefill".to_string(),
-        tokens: 3,
-        data_parallel_size: 2,
-        ..FakeConfig::default()
-    });
-    let engine = engine_for(&handle, DisaggregationMode::Prefill);
-    engine.start(0).await.unwrap();
-
+#[test]
+fn validate_rejects_disaggregated_handoff_fields() {
     let mut req = request(Some(32));
     req.bootstrap_info = Some(BootstrapInfo {
         bootstrap_host: "prefill.host".to_string(),
         bootstrap_port: 12345,
         bootstrap_room: 9_223_372_036_854_775_000,
     });
-    req.routing = Some(RoutingHints {
-        prefill_dp_rank: Some(0),
-        ..Default::default()
     });
-
-    let stream = engine
-        .generate(req, gen_ctx(fresh_ctx()))
-        .await
-        .expect("stream");
-    let chunks = collect_ok(stream).await;
-    assert_eq!(chunks.len(), 1);
-    let terminal = chunks.last().unwrap();
-    assert!(matches!(terminal.finish_reason, Some(FinishReason::Stop)));
-    let disagg = terminal.disaggregated_params.as_ref().unwrap();
-    assert_eq!(disagg["bootstrap_host"], "prefill.host");
-    assert_eq!(disagg["bootstrap_port"], 12345);
-    assert_eq!(disagg["bootstrap_room"].as_i64().unwrap() % 2, 0);
-
-    let sent = handle
-        .last_generate
-        .lock()
-        .unwrap()
-        .clone()
-        .expect("captured generate request");
-    let params = sent.disaggregated_params.unwrap();
-    assert_eq!(params.bootstrap_host, "prefill.host");
-    assert_eq!(params.bootstrap_port, 12345);
-    assert_eq!(params.bootstrap_room % 2, 0);
-    assert_eq!(sent.sampling_params.unwrap().max_new_tokens, Some(1));
-
-    engine.cleanup().await.unwrap();
-}
-
-#[tokio::test]
-async fn decode_accepts_prefill_result_disaggregated_params() {
-    let handle = spawn_fake_engine(FakeConfig {
-        role: "decode".to_string(),
-        data_parallel_size: 2,
-        ..FakeConfig::default()
-    });
-    let engine = engine_for(&handle, DisaggregationMode::Decode);
-    engine.start(0).await.unwrap();
+    let err = validate_supported_request(&req).expect_err("bootstrap_info unsupported");
+    assert_invalid_arg(err);
 
     let mut req = request(Some(4));
     req.prefill_result = Some(PrefillResult {
@@ -633,24 +553,8 @@ async fn decode_accepts_prefill_result_disaggregated_params() {
         }),
         prompt_tokens_details: None,
     });
-    let stream = engine
-        .generate(req, gen_ctx(fresh_ctx()))
-        .await
-        .expect("stream");
-    let _ = collect_ok(stream).await;
-
-    let sent = handle
-        .last_generate
-        .lock()
-        .unwrap()
-        .clone()
-        .expect("captured generate request");
-    let params = sent.disaggregated_params.unwrap();
-    assert_eq!(params.bootstrap_host, "prefill.host");
-    assert_eq!(params.bootstrap_port, 12345);
-    assert_eq!(params.bootstrap_room, 77);
-
-    engine.cleanup().await.unwrap();
+    let err = validate_supported_request(&req).expect_err("prefill_result unsupported");
+    assert_invalid_arg(err);
 }
 
 #[test]
@@ -675,8 +579,7 @@ fn build_generate_request_maps_guided_and_multimodal_fields() {
     );
     req.multi_modal_data = Some(multimodal);
 
-    let (sent, _) =
-        build_generate_request(&req, "req-1", false, &runtime_metadata()).expect("build");
+    let (sent, _) = build_generate_request(&req, "req-1", &runtime_metadata()).expect("build");
     let sampling = sent.sampling_params.expect("sampling");
     assert_eq!(
         sampling.constraint,

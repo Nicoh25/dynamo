@@ -10,7 +10,7 @@ use std::time::Duration;
 #[derive(clap::Parser, Debug, Clone)]
 #[command(
     name = "dynamo-sglang-smg-sidecar",
-    about = "Dynamo SGLang SMG sidecar — drives upstream SGLang `--grpc-mode` in agg or disagg mode."
+    about = "Dynamo SGLang SMG sidecar — drives upstream SGLang `--grpc-mode` in aggregated mode."
 )]
 pub struct Args {
     /// `host:port` (or full URL) of the upstream SGLang SMG scheduler service.

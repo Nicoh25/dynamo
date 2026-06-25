@@ -6,19 +6,17 @@
 //!
 //! The sidecar is Dynamo-only Rust. It never imports SGLang; it connects to an
 //! already-started `python -m sglang.launch_server --grpc-mode` process, reads
-//! model/server metadata, and registers itself as aggregated, prefill, or
-//! decode according to the upstream engine's own `disaggregation_mode`.
+//! model/server metadata, and registers itself as an aggregated Dynamo backend.
 
 use std::collections::HashMap;
-use std::hash::{Hash, Hasher};
 use std::net::UdpSocket;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use dynamo_backend_common::{
-    AsyncEngineContext, BootstrapInfo, DisaggregationMode, DynamoError, EngineConfig,
-    GenerateContext, HEALTH_CHECK_KEY, LLMEngine, LLMEngineOutput, LLMEngineOutputExt,
-    LlmRegistration, ModelInput, PreprocessedRequest, TopLogprob, WorkerConfig, usage,
+    AsyncEngineContext, DisaggregationMode, DynamoError, EngineConfig, GenerateContext,
+    HEALTH_CHECK_KEY, LLMEngine, LLMEngineOutput, LLMEngineOutputExt, LlmRegistration, ModelInput,
+    PreprocessedRequest, TopLogprob, WorkerConfig, usage,
 };
 use dynamo_llm::protocols::common::preprocessor::{MultimodalData, MultimodalDataMap};
 use futures::stream::BoxStream;
@@ -30,9 +28,6 @@ use tokio_util::sync::CancellationToken;
 use crate::args::{Args, TransportConfig, normalize_endpoint};
 use crate::client::{self, Client, Discovery, Pool};
 use crate::proto::scheduler as pb;
-
-const FAKE_BOOTSTRAP_HOST: &str = "__dynamo_health_check__";
-const MAX_SMG_BOOTSTRAP_ROOM: u64 = i32::MAX as u64;
 
 /// A Dynamo backend that proxies inference to an upstream SGLang SMG server.
 pub struct SglangSmgSidecarEngine {
@@ -90,6 +85,7 @@ impl SglangSmgSidecarEngine {
         let discovery = bootstrap_discover(&endpoint, &transport)?;
         validate_discovery(&discovery)?;
         let disaggregation_mode = discover_disaggregation_mode(&discovery)?;
+        reject_disaggregated_mode(disaggregation_mode)?;
         let served_model_name = served_model_name(&discovery.model);
 
         tracing::info!(
@@ -100,15 +96,9 @@ impl SglangSmgSidecarEngine {
             "SGLang SMG sidecar bootstrapped engine discovery"
         );
 
-        let (tool_call_parser, reasoning_parser) = if disaggregation_mode.is_prefill() {
-            (None, None)
-        } else {
-            (args.dyn_tool_call_parser, args.dyn_reasoning_parser)
-        };
-
         let config = WorkerConfig {
             namespace: args.namespace,
-            component: component_for_mode(disaggregation_mode).to_string(),
+            component: "backend".to_string(),
             endpoint: args.endpoint,
             endpoint_types: args.endpoint_types,
             custom_jinja_template: args.custom_jinja_template,
@@ -116,8 +106,8 @@ impl SglangSmgSidecarEngine {
             model_name: discovery.model.model_path.clone(),
             served_model_name,
             model_input: ModelInput::Tokens,
-            tool_call_parser,
-            reasoning_parser,
+            tool_call_parser: args.dyn_tool_call_parser,
+            reasoning_parser: args.dyn_reasoning_parser,
             exclude_tools_when_tool_choice_none: args.exclude_tools_when_tool_choice_none,
             enable_kv_routing: false,
             ..Default::default()
@@ -127,43 +117,23 @@ impl SglangSmgSidecarEngine {
         Ok((engine, config))
     }
 
-    /// Poll until the engine reports ready or the deadline elapses. For
-    /// aggregated workers we use SMG `HealthCheck`. For disaggregated SGLang,
-    /// upstream `HealthCheck` injects scheduler work, so readiness is based on
-    /// metadata discovery instead.
+    /// Poll until the engine reports ready or the deadline elapses.
     async fn await_ready(&self, client: &mut Client) -> Result<(), DynamoError> {
         let deadline = Instant::now() + self.transport.deadline;
         loop {
-            let retry_msg = if matches!(self.disaggregation_mode, DisaggregationMode::Aggregated) {
-                match client.health_check(pb::HealthCheckRequest {}).await {
-                    Ok(resp) => {
-                        let resp = resp.into_inner();
-                        if resp.healthy {
-                            return Ok(());
-                        }
-                        if resp.message.is_empty() {
-                            "engine health check returned unhealthy".to_string()
-                        } else {
-                            format!("engine unhealthy: {}", resp.message)
-                        }
+            let retry_msg = match client.health_check(pb::HealthCheckRequest {}).await {
+                Ok(resp) => {
+                    let resp = resp.into_inner();
+                    if resp.healthy {
+                        return Ok(());
                     }
-                    Err(status) => format!("HealthCheck RPC failed: {}", status.message()),
-                }
-            } else {
-                match client::discover(client).await {
-                    Ok(discovery) => {
-                        validate_discovery(&discovery)?;
-                        let observed = discover_disaggregation_mode(&discovery)?;
-                        if observed == self.disaggregation_mode {
-                            return Ok(());
-                        }
-                        return Err(client::invalid_arg(format!(
-                            "SGLang SMG engine role changed since bootstrap: registered as {:?} but engine now reports {:?}",
-                            self.disaggregation_mode, observed
-                        )));
+                    if resp.message.is_empty() {
+                        "engine health check returned unhealthy".to_string()
+                    } else {
+                        format!("engine unhealthy: {}", resp.message)
                     }
-                    Err(err) => format!("metadata discovery failed: {err}"),
                 }
+                Err(status) => format!("HealthCheck RPC failed: {}", status.message()),
             };
 
             if Instant::now() >= deadline {
@@ -185,6 +155,7 @@ impl LLMEngine for SglangSmgSidecarEngine {
                 "SGLang SMG sidecar already started",
             ));
         }
+        reject_disaggregated_mode(self.disaggregation_mode)?;
 
         let pool =
             Pool::connect(&self.endpoint, &self.transport, self.transport.connections).await?;
@@ -194,6 +165,7 @@ impl LLMEngine for SglangSmgSidecarEngine {
         validate_discovery(&discovery)?;
 
         let observed = discover_disaggregation_mode(&discovery)?;
+        reject_disaggregated_mode(observed)?;
         if observed != self.disaggregation_mode {
             return Err(client::invalid_arg(format!(
                 "SGLang SMG engine role changed since bootstrap: registered as {:?} but engine now reports {:?}",
@@ -202,14 +174,6 @@ impl LLMEngine for SglangSmgSidecarEngine {
         }
 
         let metadata = build_runtime_metadata(&discovery, observed);
-        if observed.is_prefill()
-            && (metadata.bootstrap_host.is_none() || metadata.bootstrap_port.is_none())
-        {
-            return Err(client::invalid_arg(
-                "SGLang SMG prefill worker did not advertise a bootstrap host/port through GetServerInfo",
-            ));
-        }
-
         let pool_size = pool.len();
         self.metadata
             .set(metadata)
@@ -248,20 +212,9 @@ impl LLMEngine for SglangSmgSidecarEngine {
             .map(Pool::stream_client)
             .ok_or_else(|| client::engine_shutdown("generate called before start"))?;
 
-        if self.disaggregation_mode.is_decode()
-            && request.prefill_result.is_none()
-            && request.bootstrap_info.is_none()
-            && !request.is_probe
-        {
-            return Err(client::invalid_arg(
-                "SGLang SMG decode worker received request with neither bootstrap_info nor prefill_result",
-            ));
-        }
-
-        let is_prefill = self.disaggregation_mode.is_prefill();
         let prompt_len = request.token_ids.len() as u32;
         let (grpc_req, prefill_disagg_json) =
-            build_generate_request(&request, ctx.id(), is_prefill, &metadata)?;
+            build_generate_request(&request, ctx.id(), &metadata)?;
         let cancel = self.cancel.clone();
 
         Ok(Box::pin(async_stream::stream! {
@@ -312,7 +265,7 @@ impl LLMEngine for SglangSmgSidecarEngine {
                                         if chunk.prompt_tokens > 0 {
                                             prompt_tokens = chunk.prompt_tokens as u32;
                                         }
-                                        if is_prefill || chunk.token_ids.is_empty() {
+                                        if chunk.token_ids.is_empty() {
                                             continue;
                                         }
                                         generated = generated.saturating_add(chunk.token_ids.len() as u32);
@@ -322,7 +275,7 @@ impl LLMEngine for SglangSmgSidecarEngine {
                                         if done.prompt_tokens > 0 {
                                             prompt_tokens = done.prompt_tokens as u32;
                                         }
-                                        if !is_prefill && generated == 0 && !done.output_ids.is_empty() {
+                                        if generated == 0 && !done.output_ids.is_empty() {
                                             generated = generated.saturating_add(done.output_ids.len() as u32);
                                             yield Ok(LLMEngineOutput {
                                                 token_ids: done.output_ids.clone(),
@@ -336,9 +289,7 @@ impl LLMEngine for SglangSmgSidecarEngine {
                                             generated,
                                         );
                                         out.index = Some(done.index);
-                                        if is_prefill {
-                                            out.disaggregated_params = prefill_disagg_json.clone();
-                                        }
+                                        out.disaggregated_params = prefill_disagg_json.clone();
                                         yield Ok(out);
                                         break;
                                     }
@@ -390,13 +341,6 @@ impl LLMEngine for SglangSmgSidecarEngine {
     }
 
     async fn health_check_payload(&self) -> Result<Option<serde_json::Value>, DynamoError> {
-        if !matches!(self.disaggregation_mode, DisaggregationMode::Aggregated) {
-            // Disaggregated probes need a real bootstrap handoff. The runtime
-            // canary cannot synthesize one that is valid for both SGLang
-            // transfer backends and topology-routed workers.
-            return Ok(None);
-        }
-
         let mut payload = serde_json::json!({
             "token_ids": [1],
             "stop_conditions": {"max_tokens": 1, "ignore_eos": true},
@@ -483,11 +427,13 @@ fn discover_disaggregation_mode(discovery: &Discovery) -> Result<DisaggregationM
     }
 }
 
-fn component_for_mode(mode: DisaggregationMode) -> &'static str {
-    if mode.is_prefill() {
-        "prefill"
+fn reject_disaggregated_mode(mode: DisaggregationMode) -> Result<(), DynamoError> {
+    if matches!(mode, DisaggregationMode::Aggregated) {
+        Ok(())
     } else {
-        "backend"
+        Err(client::invalid_arg(format!(
+            "SGLang SMG sidecar supports aggregated serving only; upstream SMG reported {mode:?}"
+        )))
     }
 }
 
@@ -660,6 +606,9 @@ fn prost_value_as_u64(value: &prost_types::Value) -> Option<u64> {
 // ============================================================================
 
 pub(crate) fn validate_supported_request(request: &PreprocessedRequest) -> Result<(), DynamoError> {
+    if request.bootstrap_info.is_some() || request.prefill_result.is_some() {
+        return Err(unsupported("disaggregated handoff"));
+    }
     if request.prompt_embeds.is_some() {
         return Err(unsupported("prompt embeddings"));
     }
@@ -699,29 +648,24 @@ pub(crate) fn validate_supported_request(request: &PreprocessedRequest) -> Resul
 
 fn unsupported(feature: &str) -> DynamoError {
     client::invalid_arg(format!(
-        "SGLang SMG sidecar supports aggregated and disaggregated text/token generation with URL multimodal passthrough; unsupported feature: {feature}"
+        "SGLang SMG sidecar supports aggregated text/token generation with URL multimodal passthrough; unsupported feature: {feature}"
     ))
 }
 
 pub(crate) fn build_generate_request(
     request: &PreprocessedRequest,
-    request_id: &str,
-    is_prefill: bool,
-    metadata: &RuntimeMetadata,
+    _request_id: &str,
+    _metadata: &RuntimeMetadata,
 ) -> Result<(pb::GenerateRequest, Option<serde_json::Value>), DynamoError> {
     validate_supported_request(request)?;
 
-    let disaggregated_params =
-        build_disaggregated_params(request, request_id, is_prefill, metadata)?;
-    let prefill_disagg_json = if is_prefill {
-        disaggregated_params
-            .as_ref()
-            .map(disaggregated_params_to_json)
-    } else {
-        None
-    };
+    let disaggregated_params = None;
+    let prefill_disagg_json = None;
 
-    let data_parallel_rank = routed_dp_rank(request, is_prefill)
+    let data_parallel_rank = request
+        .routing
+        .as_ref()
+        .and_then(|r| r.dp_rank)
         .map(|r| i32::try_from(r).unwrap_or(i32::MAX))
         .unwrap_or(-1);
 
@@ -733,7 +677,7 @@ pub(crate) fn build_generate_request(
                 input_ids: request.token_ids.clone(),
             }),
             mm_inputs: build_multimodal_inputs(request)?,
-            sampling_params: Some(build_sampling_params(request, is_prefill)?),
+            sampling_params: Some(build_sampling_params(request)?),
             return_logprob: request.output_options.logprobs.is_some()
                 || request.output_options.prompt_logprobs.is_some(),
             logprob_start_len: if request.output_options.prompt_logprobs.is_some() {
@@ -766,29 +710,13 @@ pub(crate) fn build_generate_request(
     ))
 }
 
-fn routed_dp_rank(request: &PreprocessedRequest, is_prefill: bool) -> Option<u32> {
-    request.routing.as_ref().and_then(|r| {
-        if is_prefill {
-            r.prefill_dp_rank.or(r.dp_rank)
-        } else {
-            r.dp_rank
-        }
-    })
-}
-
-fn build_sampling_params(
-    request: &PreprocessedRequest,
-    is_prefill: bool,
-) -> Result<pb::SamplingParams, DynamoError> {
+fn build_sampling_params(request: &PreprocessedRequest) -> Result<pb::SamplingParams, DynamoError> {
     let sampling = &request.sampling_options;
     let stop = &request.stop_conditions;
-    let max_new_tokens = if is_prefill {
-        Some(1)
-    } else {
-        stop.max_tokens
-            .map(|v| i32::try_from(v).map_err(|_| client::invalid_arg("max_tokens exceeds int32")))
-            .transpose()?
-    };
+    let max_new_tokens = stop
+        .max_tokens
+        .map(|v| i32::try_from(v).map_err(|_| client::invalid_arg("max_tokens exceeds int32")))
+        .transpose()?;
 
     let mut stop_token_ids = Vec::new();
     if let Some(ids) = &stop.stop_token_ids {
@@ -914,125 +842,6 @@ fn push_media_urls(
     Ok(())
 }
 
-fn build_disaggregated_params(
-    request: &PreprocessedRequest,
-    request_id: &str,
-    is_prefill: bool,
-    metadata: &RuntimeMetadata,
-) -> Result<Option<pb::DisaggregatedParams>, DynamoError> {
-    if let Some(info) = request.bootstrap_info.as_ref() {
-        return Ok(Some(bootstrap_info_to_params(
-            info,
-            metadata.data_parallel_size,
-        )?));
-    }
-    if let Some(prefill) = request.prefill_result.as_ref() {
-        return Ok(Some(disagg_json_to_params(
-            &prefill.disaggregated_params,
-            metadata.data_parallel_size,
-        )?));
-    }
-    if is_prefill {
-        let (Some(host), Some(port)) = (
-            metadata.bootstrap_host.as_ref(),
-            metadata.bootstrap_port.as_ref(),
-        ) else {
-            return Err(client::invalid_arg(
-                "SGLang SMG prefill worker has no bootstrap host/port",
-            ));
-        };
-        let room = fallback_room(request_id);
-        return Ok(Some(pb::DisaggregatedParams {
-            bootstrap_host: host.clone(),
-            bootstrap_port: i32::from(*port),
-            bootstrap_room: normalize_bootstrap_room(room, metadata.data_parallel_size)?,
-        }));
-    }
-    if request.is_probe {
-        return Ok(Some(pb::DisaggregatedParams {
-            bootstrap_host: FAKE_BOOTSTRAP_HOST.to_string(),
-            bootstrap_port: 0,
-            bootstrap_room: 0,
-        }));
-    }
-    Ok(None)
-}
-
-fn bootstrap_info_to_params(
-    info: &BootstrapInfo,
-    dp_size: Option<u32>,
-) -> Result<pb::DisaggregatedParams, DynamoError> {
-    Ok(pb::DisaggregatedParams {
-        bootstrap_host: info.bootstrap_host.clone(),
-        bootstrap_port: i32::from(info.bootstrap_port),
-        bootstrap_room: normalize_bootstrap_room(info.bootstrap_room, dp_size)?,
-    })
-}
-
-fn disagg_json_to_params(
-    value: &serde_json::Value,
-    dp_size: Option<u32>,
-) -> Result<pb::DisaggregatedParams, DynamoError> {
-    let obj = value.as_object().ok_or_else(|| {
-        client::invalid_arg("disaggregated_params must be a JSON object with bootstrap metadata")
-    })?;
-    let host = obj
-        .get("bootstrap_host")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| client::invalid_arg("disaggregated_params missing bootstrap_host"))?;
-    let port = obj
-        .get("bootstrap_port")
-        .and_then(json_u64)
-        .and_then(|p| i32::try_from(p).ok())
-        .ok_or_else(|| client::invalid_arg("disaggregated_params missing bootstrap_port"))?;
-    let room = obj
-        .get("bootstrap_room")
-        .and_then(json_u64)
-        .ok_or_else(|| client::invalid_arg("disaggregated_params missing bootstrap_room"))?;
-
-    Ok(pb::DisaggregatedParams {
-        bootstrap_host: host.to_string(),
-        bootstrap_port: port,
-        bootstrap_room: normalize_bootstrap_room(room, dp_size)?,
-    })
-}
-
-fn disaggregated_params_to_json(params: &pb::DisaggregatedParams) -> serde_json::Value {
-    serde_json::json!({
-        "bootstrap_host": params.bootstrap_host.clone(),
-        "bootstrap_port": params.bootstrap_port,
-        "bootstrap_room": params.bootstrap_room,
-    })
-}
-
-fn fallback_room(request_id: &str) -> u64 {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    request_id.hash(&mut hasher);
-    hasher.finish()
-}
-
-fn normalize_bootstrap_room(room: u64, dp_size: Option<u32>) -> Result<i32, DynamoError> {
-    let span = match dp_size {
-        Some(size) if size > 0 => {
-            let size = u64::from(size);
-            (MAX_SMG_BOOTSTRAP_ROOM / size).saturating_mul(size).max(1)
-        }
-        _ => MAX_SMG_BOOTSTRAP_ROOM,
-    };
-    let room = room % span;
-    i32::try_from(room).map_err(|_| {
-        client::invalid_arg(format!(
-            "bootstrap_room {room} cannot fit SGLang SMG int32 field"
-        ))
-    })
-}
-
-fn json_u64(value: &serde_json::Value) -> Option<u64> {
-    value
-        .as_u64()
-        .or_else(|| value.as_i64().and_then(|v| u64::try_from(v).ok()))
-        .or_else(|| value.as_str().and_then(|s| s.parse().ok()))
-}
 
 fn chunk_output(chunk: pb::GenerateStreamChunk) -> LLMEngineOutput {
     let (log_probs, top_logprobs) = map_output_logprobs(chunk.output_logprobs.as_ref());
