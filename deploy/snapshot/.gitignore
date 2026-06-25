@@ -27,3 +27,5 @@ coverage.out
 *.tmp
 *.tar
 /tmp/
+
+# Temporary CI filter trigger for PR 10844 DynamoCheckpoint validation.
