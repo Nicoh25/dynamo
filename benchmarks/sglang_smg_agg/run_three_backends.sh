@@ -144,6 +144,7 @@ run_smg_agg() {
         --port "$smg_port" \
         --skip-server-warmup \
         --disable-cuda-graph \
+        --disable-piecewise-cuda-graph \
         >>"$server_log" 2>&1 &
     cleanup_pids+=("$!")
 
