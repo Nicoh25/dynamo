@@ -842,7 +842,6 @@ fn push_media_urls(
     Ok(())
 }
 
-
 fn chunk_output(chunk: pb::GenerateStreamChunk) -> LLMEngineOutput {
     let (log_probs, top_logprobs) = map_output_logprobs(chunk.output_logprobs.as_ref());
     LLMEngineOutput {
