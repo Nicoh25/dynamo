@@ -96,6 +96,20 @@ def test_build_mixed_embeds_raises_on_bad_tensor_shape():
         )
 
 
+def test_build_mixed_embeds_raises_on_dtype_mismatch():
+    """Image tensors with differing dtypes must raise rather than be silently
+    cast to image tensor 0's dtype on scatter."""
+    with pytest.raises(ValueError, match="dtype"):
+        build_mixed_embeds(
+            [1, _PLACEHOLDER, _PLACEHOLDER, 2],
+            [
+                torch.ones(1, _HIDDEN, dtype=torch.float16),
+                torch.ones(1, _HIDDEN, dtype=torch.float32),
+            ],
+            _PLACEHOLDER,
+        )
+
+
 def test_build_mixed_embeds_raises_on_empty_rows():
     """A (0, hidden) encoder tensor passes the 2D/hidden checks but would erase
     the image's placeholder run, silently dropping the image — must raise."""

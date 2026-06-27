@@ -50,13 +50,14 @@ def build_mixed_embeds(
         ``(prompt_embeds, prompt_token_ids, prompt_is_token_ids)`` where
         ``prompt_embeds`` is a CPU ``(seq_len, hidden)`` tensor (text rows zero,
         image rows from ``img_tensors``), ``prompt_token_ids`` has each
-        placeholder token expanded to its tensor's row count, and
-        ``prompt_is_token_ids[i]`` is ``False`` at image positions.
+        placeholder token expanded to its tensor's row count (the encoder's
+        visual-token count for that image), and ``prompt_is_token_ids[i]`` is
+        ``False`` at image positions.
 
     Raises:
         ValueError: if ``img_tensors`` is empty, the number of placeholder
             tokens does not equal the number of image tensors, or the tensors
-            are not 2D with a consistent hidden dim.
+            are not all 2D with a consistent hidden dim and dtype.
     """
     if not img_tensors:
         raise ValueError("img_tensors must not be empty")
@@ -85,6 +86,14 @@ def build_mixed_embeds(
             raise ValueError(
                 f"image tensor {i} has shape {tuple(tensor.shape)}; expected "
                 f"2D with hidden dim {hidden} (from image tensor 0)"
+            )
+        # Reject a mismatched dtype rather than silently casting it on scatter
+        # below — a differing dtype signals an encoder bug, not something to
+        # paper over with an implicit cast.
+        if tensor.dtype != dtype:
+            raise ValueError(
+                f"image tensor {i} has dtype {tensor.dtype}; expected {dtype} "
+                "(from image tensor 0)"
             )
         # A (0, hidden) tensor would erase the image's placeholder run entirely,
         # silently dropping the image — an encoder bug, so fail loudly.
@@ -122,7 +131,9 @@ def build_mixed_embeds(
     prompt_embeds = torch.zeros(seq_len, hidden, dtype=dtype)
     for row_start, tensor in image_slots:
         n = tensor.shape[0]
-        prompt_embeds[row_start : row_start + n] = tensor.to(dtype=dtype, device="cpu")
+        # Slice assignment runs copy_, which moves the encoder tensor (typically
+        # on GPU) down to this CPU buffer; dtype already matches (validated above).
+        prompt_embeds[row_start : row_start + n] = tensor
 
     logger.debug(
         "[custom_embeds] images=%d seq_len=%d hidden=%d dtype=%s",
