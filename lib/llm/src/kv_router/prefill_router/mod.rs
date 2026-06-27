@@ -22,6 +22,7 @@ use dynamo_runtime::{
 
 use crate::{
     discovery::ModelManager,
+    kv_router::metrics::PREFILL_ASSIGNMENT_METRICS,
     protocols::common::{
         extensions::{SESSION_AFFINITY_CONTEXT_KEY, SessionAffinityId},
         llm_backend::{LLMEngineOutput, PreprocessedRequest},
@@ -359,6 +360,8 @@ impl PrefillRouter {
         routing.prefill_worker_id = Some(worker_id);
         routing.prefill_dp_rank = dp_rank;
         request.bootstrap_info = bootstrap_info.clone();
+
+        PREFILL_ASSIGNMENT_METRICS.observe(worker_id, dp_rank, request.token_ids.len());
 
         Ok(PreparedPrefill {
             worker_id,

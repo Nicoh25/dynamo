@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use dynamo_kv_router::LocalBlockHash;
-use dynamo_kv_router::config::KvRouterConfig;
+use dynamo_kv_router::config::{KvRouterConfig, RouterWorkerSelectionPolicy};
 use dynamo_kv_router::protocols::{
     BlockHashOptions, OverlapScores, PrefillLoadHint, RouterEvent, RoutingConstraints,
     WorkerConfigLike, WorkerId, WorkerWithDpRank, compute_block_hash_for_seq,
@@ -26,7 +26,7 @@ use rustc_hash::FxHashMap;
 use tokio::time::Instant;
 use uuid::Uuid;
 
-use super::{RouterEffects, WorkerAdmission};
+use super::{RouterEffects, ShadowSelection, WorkerAdmission};
 use crate::common::protocols::DirectRequest;
 use crate::common::protocols::MockEngineArgs;
 use crate::loadgen::ReplayRequestHashes;
@@ -44,7 +44,10 @@ struct AdmitOutcome {
     worker_idx: usize,
     overlap_blocks: u32,
     isl_blocks: u32,
+    shadow: Option<ShadowSelection>,
 }
+
+const SHADOW_POLICY_ENV: &str = "DYN_REPLAY_SHADOW_WORKER_SELECTION_POLICY";
 
 #[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -194,6 +197,8 @@ pub(crate) struct OfflineReplayRouter {
     workers_with_configs: HashMap<WorkerId, ReplayWorkerConfig>,
     slots: Arc<ActiveSequencesMultiWorker<ReplayNoopPublisher>>,
     selector: DefaultWorkerSelector,
+    shadow_selector: Option<DefaultWorkerSelector>,
+    shadow_policy: Option<RouterWorkerSelectionPolicy>,
     pending: PolicyQueue<PendingRequest>,
     indexer: SyncReplayIndexer,
     prefill_load_estimator: Option<ReplayPrefillLoadEstimator>,
@@ -207,11 +212,44 @@ impl OfflineReplayRouter {
         prefill_load_estimator: Option<ReplayPrefillLoadEstimator>,
         num_workers: usize,
     ) -> Result<Self> {
+        let shadow_policy = if args.is_prefill() {
+            std::env::var(SHADOW_POLICY_ENV)
+                .ok()
+                .map(|value| {
+                    value.parse::<RouterWorkerSelectionPolicy>().map_err(|error| {
+                        anyhow!("invalid {SHADOW_POLICY_ENV} value {value:?}: {error}")
+                    })
+                })
+                .transpose()?
+        } else {
+            None
+        };
+        Self::new_with_shadow_policy(
+            args,
+            router_config,
+            prefill_load_estimator,
+            num_workers,
+            shadow_policy,
+        )
+    }
+
+    pub(crate) fn new_with_shadow_policy(
+        args: &MockEngineArgs,
+        router_config: Option<KvRouterConfig>,
+        prefill_load_estimator: Option<ReplayPrefillLoadEstimator>,
+        num_workers: usize,
+        shadow_policy: Option<RouterWorkerSelectionPolicy>,
+    ) -> Result<Self> {
         let config = replay_router_config(args, router_config);
         let worker_config_template = replay_worker_config(args);
         let workers_with_configs = replay_workers_with_configs(args, num_workers);
         let slots = replay_slots(args, &workers_with_configs);
         let selector = replay_selector(&config);
+        let shadow_selector = shadow_policy.map(|policy| {
+            let mut shadow_config = config.clone();
+            shadow_config.router_worker_selection_policy = policy;
+            replay_selector(&shadow_config)
+        });
         let profile = config
             .configured_policy_profile()
             .map_err(anyhow::Error::from)?;
@@ -224,6 +262,8 @@ impl OfflineReplayRouter {
             workers_with_configs,
             slots,
             selector,
+            shadow_selector,
+            shadow_policy,
             pending: PolicyQueue::new(profile),
             indexer: SyncReplayIndexer::new(args.block_size as u32),
             prefill_load_estimator,
@@ -290,6 +330,7 @@ impl OfflineReplayRouter {
                 worker_idx: outcome.worker_idx,
                 overlap_blocks: outcome.overlap_blocks,
                 isl_blocks: outcome.isl_blocks,
+                shadow: outcome.shadow,
             }],
         })
     }
@@ -528,12 +569,33 @@ impl OfflineReplayRouter {
             .project_worker_loads(request.token_seq.as_deref(), decay_now);
         let scheduling_request = request.scheduling_request(self.block_size as usize, worker_loads);
         let eligibility = scheduling_request.eligibility();
-        let selection = self.selector.select_worker(
+        let (selection, primary_diagnostics) = self.selector.select_worker_with_diagnostics(
             &self.workers_with_configs,
             &scheduling_request,
             eligibility,
             self.block_size,
         )?;
+        let shadow = if let Some((selector, shadow_policy)) =
+            self.shadow_selector.as_ref().zip(self.shadow_policy)
+        {
+            let (shadow_selection, shadow_diagnostics) = selector
+                .select_worker_with_diagnostics(
+                    &self.workers_with_configs,
+                    &scheduling_request,
+                    eligibility,
+                    self.block_size,
+                )?;
+            Some(ShadowSelection {
+                primary_policy: self.config.router_worker_selection_policy,
+                primary_tie_count: primary_diagnostics.tied_minimum_count,
+                shadow_policy,
+                shadow_worker_idx: usize::try_from(shadow_selection.worker.worker_id)
+                    .map_err(|_| anyhow!("shadow worker id does not fit into usize"))?,
+                shadow_tie_count: shadow_diagnostics.tied_minimum_count,
+            })
+        } else {
+            None
+        };
         let worker_idx = usize::try_from(selection.worker.worker_id)
             .map_err(|_| anyhow!("selected worker id does not fit into usize"))?;
         let request_id = request.request_id();
@@ -566,6 +628,7 @@ impl OfflineReplayRouter {
             worker_idx,
             overlap_blocks,
             isl_blocks,
+            shadow,
         })
     }
 
@@ -587,6 +650,7 @@ impl OfflineReplayRouter {
                 worker_idx: outcome.worker_idx,
                 overlap_blocks: outcome.overlap_blocks,
                 isl_blocks: outcome.isl_blocks,
+                shadow: outcome.shadow,
             });
         }
 
@@ -670,11 +734,16 @@ mod tests {
     use std::time::Duration;
 
     use dynamo_kv_router::PrefillLoadEstimator;
-    use dynamo_kv_router::config::{KvRouterConfig, RouterPrefillLoadModel, RouterQueuePolicy};
+    use dynamo_kv_router::config::{
+        KvRouterConfig, RouterPrefillLoadModel, RouterQueuePolicy, RouterWorkerSelectionPolicy,
+    };
     use dynamo_kv_router::protocols::{
         ExternalSequenceBlockHash, KvCacheEvent, KvCacheEventData, KvCacheStoreData,
-        KvCacheStoredBlockData, LocalBlockHash, RouterEvent, StorageTier, WorkerId,
+        KvCacheStoredBlockData, LocalBlockHash, PrefillLoadHint, RouterEvent, StorageTier, WorkerId,
+        WorkerWithDpRank,
     };
+    use dynamo_kv_router::SequenceRequest;
+    use tokio::time::Instant;
     use uuid::Uuid;
 
     use super::{OfflineReplayRouter, ReplayRequestHashes, SyncReplayIndexer, WorkerAdmission};
@@ -1235,6 +1304,7 @@ policy_classes:
                 worker_idx: 3,
                 overlap_blocks: 0,
                 isl_blocks: 1,
+                shadow: None,
             }]
         );
     }
@@ -1332,6 +1402,7 @@ policy_classes:
                 worker_idx: 1,
                 overlap_blocks: 0,
                 isl_blocks: 1,
+                shadow: None,
             }]
         );
         assert_eq!(router.pending_count(), 0);
@@ -1339,6 +1410,70 @@ policy_classes:
             router.debug_snapshot(0.0).active_tokens_by_worker,
             vec![(0, 64), (1, 64)]
         );
+    }
+
+    #[test]
+    fn shadow_policy_uses_same_pre_admission_state_and_reports_unique_choices() {
+        let mut config = KvRouterConfig::default();
+        config.router_queue_threshold = None;
+        config.router_worker_selection_policy = RouterWorkerSelectionPolicy::Default;
+        let mut router = OfflineReplayRouter::new_with_shadow_policy(
+            &replay_args(),
+            Some(config),
+            None,
+            2,
+            Some(RouterWorkerSelectionPolicy::PrefillTokenBalance),
+        )
+        .unwrap();
+        let now = Instant::now();
+
+        router
+            .slots
+            .add_request(
+                SequenceRequest {
+                    request_id: "load-worker-0".to_string(),
+                    token_sequence: Some((1..=100).collect()),
+                    track_prefill_tokens: true,
+                    expected_output_tokens: Some(1),
+                    prefill_load_hint: Some(PrefillLoadHint {
+                        initial_effective_prefill_tokens: 10,
+                        expected_prefill_duration: None,
+                    }),
+                    worker: WorkerWithDpRank::from_worker_id(0),
+                    lora_name: None,
+                },
+                now,
+            )
+            .unwrap();
+        router
+            .slots
+            .add_request(
+                SequenceRequest {
+                    request_id: "load-worker-1".to_string(),
+                    token_sequence: Some(vec![1001]),
+                    track_prefill_tokens: true,
+                    expected_output_tokens: Some(1),
+                    prefill_load_hint: Some(PrefillLoadHint {
+                        initial_effective_prefill_tokens: 100,
+                        expected_prefill_duration: None,
+                    }),
+                    worker: WorkerWithDpRank::from_worker_id(1),
+                    lora_name: None,
+                },
+                now,
+            )
+            .unwrap();
+
+        let effects = router
+            .on_request_arrival(&request(3, 9), None, 0.0)
+            .unwrap();
+        let admission = effects.admissions[0];
+        let shadow = admission.shadow.expect("shadow decision");
+
+        assert_eq!(admission.worker_idx, 1);
+        assert_eq!(shadow.shadow_worker_idx, 0);
+        assert_eq!(shadow.primary_tie_count, Some(1));
+        assert_eq!(shadow.shadow_tie_count, Some(1));
     }
 
     #[test]

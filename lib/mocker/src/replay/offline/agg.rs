@@ -342,6 +342,7 @@ impl AggRuntime {
             worker_idx,
             overlap_blocks,
             isl_blocks,
+            ..
         } in admissions
         {
             self.traffic.on_admission(overlap_blocks, isl_blocks);

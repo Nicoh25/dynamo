@@ -776,6 +776,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         choices=("round_robin", "kv_router"),
         default="round_robin",
     )
+    parser.add_argument(
+        "--shadow-router-worker-selection-policy",
+        choices=("default", "prefill-token-balance"),
+        help=(
+            "offline KV replay only: evaluate this worker-selection policy "
+            "against the same pre-admission state and emit shadow fields via --report-jsonl"
+        ),
+    )
     parser.add_argument("--arrival-speedup-ratio", type=float, default=1.0)
     parser.add_argument(
         "--trace-format",
@@ -909,6 +917,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             parser.error("--report-jsonl is not supported with --planner-config")
         if not using_trace_file:
             parser.error("--report-jsonl currently only supports trace-file replay")
+    if args.shadow_router_worker_selection_policy is not None:
+        if args.replay_mode != "offline" or args.router_mode != "kv_router":
+            parser.error(
+                "--shadow-router-worker-selection-policy requires "
+                "--replay-mode=offline --router-mode=kv_router"
+            )
+        if args.report_jsonl is None:
+            parser.error("--shadow-router-worker-selection-policy requires --report-jsonl")
     if args.max_sim_time_seconds is not None:
         if args.planner_config is not None:
             parser.error(
@@ -933,6 +949,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         args.router_config,
         args.router_policy_config,
     )
+    shadow_policy_env = "DYN_REPLAY_SHADOW_WORKER_SELECTION_POLICY"
+    if args.shadow_router_worker_selection_policy is None:
+        os.environ.pop(shadow_policy_env, None)
+    else:
+        os.environ[shadow_policy_env] = args.shadow_router_worker_selection_policy
     try:
         aic_perf_config = _load_aic_perf_config(args)
     except ValueError as exc:

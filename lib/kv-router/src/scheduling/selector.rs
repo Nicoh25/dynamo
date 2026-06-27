@@ -24,6 +24,17 @@ pub trait WorkerSelector<C: WorkerConfigLike> {
     ) -> Result<WorkerSelectionResult, KvSchedulerError>;
 }
 
+/// Diagnostic metadata for a worker-selection decision.
+///
+/// `tied_minimum_count` is populated only for zero-temperature selection. It
+/// allows replay tooling to distinguish a policy difference from randomized
+/// selection among equivalent minima.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct WorkerSelectionDiagnostics {
+    pub selected_score: f64,
+    pub tied_minimum_count: Option<usize>,
+}
+
 /// Helper function for softmax sampling.
 /// Returns the selected worker and its logit.
 fn softmax_sample(
@@ -288,6 +299,116 @@ impl DefaultWorkerSelector {
                 self.prefill_token_balance_logit(request, worker)
             }
         }
+    }
+
+    /// Select a worker and return enough metadata for offline shadow-policy
+    /// comparisons. This method is side-effect free, just like `select_worker`.
+    pub fn select_worker_with_diagnostics<C: WorkerConfigLike>(
+        &self,
+        workers: &HashMap<WorkerId, C>,
+        request: &SchedulingRequest,
+        eligibility: RoutingEligibility<'_>,
+        block_size: u32,
+    ) -> Result<(WorkerSelectionResult, WorkerSelectionDiagnostics), KvSchedulerError> {
+        let selection = <Self as WorkerSelector<C>>::select_worker(
+            self,
+            workers,
+            request,
+            eligibility,
+            block_size,
+        )?;
+
+        let weights = LogitWeights {
+            overlap_score_credit: request
+                .router_config_override
+                .as_ref()
+                .and_then(|cfg| cfg.overlap_score_credit)
+                .unwrap_or(self.kv_router_config.overlap_score_credit),
+            overlap_score_credit_decay: self.kv_router_config.overlap_score_credit_decay,
+            prefill_load_scale: request
+                .router_config_override
+                .as_ref()
+                .and_then(|cfg| cfg.prefill_load_scale)
+                .unwrap_or(self.kv_router_config.prefill_load_scale),
+            shared_cache_multiplier: request
+                .router_config_override
+                .as_ref()
+                .and_then(|cfg| cfg.shared_cache_multiplier)
+                .unwrap_or(self.kv_router_config.shared_cache_multiplier),
+        };
+        let min_active_prefill_tokens =
+            if request.track_prefill_tokens && weights.overlap_score_credit_decay > 0.0 {
+                let mut minimum = usize::MAX;
+                eligibility.for_each_eligible_worker_rank(workers, |worker, _| {
+                    minimum = minimum.min(request.worker_load_for(worker).active_prefill_tokens);
+                });
+                minimum
+            } else {
+                0
+            };
+        let get_score = |worker: WorkerWithDpRank| -> f64 {
+            let base_score = self.selection_logit(
+                request,
+                worker,
+                block_size,
+                min_active_prefill_tokens,
+                weights,
+                "Diagnostic formula",
+            );
+            let Some(config) = workers.get(&worker.worker_id) else {
+                return base_score;
+            };
+            request
+                .routing_constraints
+                .preferred_taint_multiplier(config.taints())
+                .map_or(base_score, |multiplier| base_score * multiplier)
+        };
+        let selected_score = get_score(selection.worker);
+
+        if eligibility.pinned_worker().is_some() {
+            return Ok((
+                selection,
+                WorkerSelectionDiagnostics {
+                    selected_score,
+                    tied_minimum_count: Some(1),
+                },
+            ));
+        }
+
+        let temperature = request
+            .router_config_override
+            .as_ref()
+            .and_then(|cfg| cfg.router_temperature)
+            .unwrap_or(self.kv_router_config.router_temperature);
+        if temperature != 0.0 {
+            return Ok((
+                selection,
+                WorkerSelectionDiagnostics {
+                    selected_score,
+                    tied_minimum_count: None,
+                },
+            ));
+        }
+
+        let mut minimum = f64::INFINITY;
+        let mut tied_minimum_count = 0usize;
+        eligibility.for_each_eligible_worker_rank(workers, |worker, _| {
+            let score = get_score(worker);
+            if score < minimum {
+                minimum = score;
+                tied_minimum_count = 1;
+            } else if score == minimum {
+                tied_minimum_count += 1;
+            }
+        });
+
+        Ok((
+            selection,
+            WorkerSelectionDiagnostics {
+                selected_score,
+                tied_minimum_count: Some(tied_minimum_count),
+            },
+        ))
     }
 }
 
@@ -948,6 +1069,43 @@ mod tests {
             selected_count > 1,
             "prefill-token-balance exact ties should keep randomized tie-breaking"
         );
+    }
+
+    #[test]
+    fn selection_diagnostics_report_unique_and_tied_minima() {
+        use crate::test_utils::SimpleWorkerConfig;
+
+        let workers = HashMap::from([
+            (0, SimpleWorkerConfig::default()),
+            (1, SimpleWorkerConfig::default()),
+            (2, SimpleWorkerConfig::default()),
+        ]);
+        let selector = DefaultWorkerSelector::new(
+            Some(KvRouterConfig {
+                router_worker_selection_policy: RouterWorkerSelectionPolicy::PrefillTokenBalance,
+                router_temperature: 0.0,
+                ..Default::default()
+            }),
+            "test",
+        );
+
+        let tied = base_request(64);
+        let (_, tied_diagnostics) = selector
+            .select_worker_with_diagnostics(&workers, &tied, tied.eligibility(), 64)
+            .unwrap();
+        assert_eq!(tied_diagnostics.tied_minimum_count, Some(3));
+
+        let mut unique = base_request(64);
+        unique.worker_loads = worker_loads_with_active_prefill(FxHashMap::from_iter([
+            (WorkerWithDpRank::from_worker_id(0), 128),
+            (WorkerWithDpRank::from_worker_id(1), 0),
+            (WorkerWithDpRank::from_worker_id(2), 256),
+        ]));
+        let (selection, unique_diagnostics) = selector
+            .select_worker_with_diagnostics(&workers, &unique, unique.eligibility(), 64)
+            .unwrap();
+        assert_eq!(selection.worker.worker_id, 1);
+        assert_eq!(unique_diagnostics.tied_minimum_count, Some(1));
     }
 
     #[test]

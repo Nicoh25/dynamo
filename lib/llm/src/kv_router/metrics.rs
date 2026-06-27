@@ -310,6 +310,79 @@ pub fn register_worker_load_metrics(
 }
 
 // ---------------------------------------------------------------------------
+// Prefill assignment metrics (policy-independent counters)
+// ---------------------------------------------------------------------------
+
+/// Per-worker counters recorded after a prefill target has been selected.
+///
+/// These counters intentionally live above the concrete router implementation so
+/// simple routing modes (for example round-robin) and KV routing expose the same
+/// assignment accounting.
+pub struct PrefillAssignmentMetrics {
+    pub assigned_requests_total: IntCounterVec,
+    pub assigned_input_tokens_total: IntCounterVec,
+}
+
+impl PrefillAssignmentMetrics {
+    fn new() -> Self {
+        Self {
+            assigned_requests_total: IntCounterVec::new(
+                Opts::new(
+                    format!(
+                        "{}_prefill_worker_assigned_requests_total",
+                        name_prefix::FRONTEND
+                    ),
+                    "Total prefill requests assigned to each worker",
+                ),
+                &[labels::WORKER_ID, labels::DP_RANK],
+            )
+            .expect("Failed to create prefill_worker_assigned_requests_total counter"),
+            assigned_input_tokens_total: IntCounterVec::new(
+                Opts::new(
+                    format!(
+                        "{}_prefill_worker_assigned_input_tokens_total",
+                        name_prefix::FRONTEND
+                    ),
+                    "Total tokenized input tokens assigned to each prefill worker",
+                ),
+                &[labels::WORKER_ID, labels::DP_RANK],
+            )
+            .expect("Failed to create prefill_worker_assigned_input_tokens_total counter"),
+        }
+    }
+
+    pub fn observe(&self, worker_id: u64, dp_rank: Option<u32>, input_tokens: usize) {
+        let worker_id = worker_id.to_string();
+        let dp_rank = dp_rank
+            .map(|rank| rank.to_string())
+            .unwrap_or_else(|| "none".to_string());
+        let label_values = &[worker_id.as_str(), dp_rank.as_str()];
+        self.assigned_requests_total
+            .with_label_values(label_values)
+            .inc();
+        self.assigned_input_tokens_total
+            .with_label_values(label_values)
+            .inc_by(input_tokens as u64);
+    }
+}
+
+pub static PREFILL_ASSIGNMENT_METRICS: LazyLock<PrefillAssignmentMetrics> =
+    LazyLock::new(PrefillAssignmentMetrics::new);
+
+/// Register policy-independent prefill assignment counters with the frontend
+/// Prometheus registry.
+pub fn register_prefill_assignment_metrics(
+    registry: &prometheus::Registry,
+) -> Result<(), prometheus::Error> {
+    let metrics = &*PREFILL_ASSIGNMENT_METRICS;
+    registry.register(Box::new(metrics.assigned_requests_total.clone()))?;
+    registry.register(Box::new(
+        metrics.assigned_input_tokens_total.clone(),
+    ))?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Router queue metrics (gauge)
 // ---------------------------------------------------------------------------
 
@@ -828,6 +901,57 @@ dynamo_frontend_worker_active_prefill_tokens{dp_rank=\"0\",worker_id=\"123\",wor
             output, expected,
             "\nActual PEF:\n{output}\nExpected PEF:\n{expected}"
         );
+    }
+
+    #[test]
+    fn test_prefill_assignment_metrics_count_requests_tokens_and_ranks() {
+        let registry = prometheus::Registry::new();
+        let metrics = PrefillAssignmentMetrics::new();
+        registry
+            .register(Box::new(metrics.assigned_requests_total.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(metrics.assigned_input_tokens_total.clone()))
+            .unwrap();
+
+        metrics.observe(123, None, 128);
+        metrics.observe(123, None, 512);
+        metrics.observe(123, Some(0), 256);
+        metrics.observe(456, Some(3), 1024);
+
+        let output = gather_pef(&registry);
+        assert!(output.contains(
+            "dynamo_frontend_prefill_worker_assigned_requests_total{dp_rank=\"none\",worker_id=\"123\"} 2"
+        ));
+        assert!(output.contains(
+            "dynamo_frontend_prefill_worker_assigned_input_tokens_total{dp_rank=\"none\",worker_id=\"123\"} 640"
+        ));
+        assert!(output.contains(
+            "dynamo_frontend_prefill_worker_assigned_requests_total{dp_rank=\"0\",worker_id=\"123\"} 1"
+        ));
+        assert!(output.contains(
+            "dynamo_frontend_prefill_worker_assigned_input_tokens_total{dp_rank=\"3\",worker_id=\"456\"} 1024"
+        ));
+    }
+
+    #[test]
+    fn test_register_prefill_assignment_metrics() {
+        let registry = prometheus::Registry::new();
+        register_prefill_assignment_metrics(&registry).unwrap();
+
+        let metric_names = registry
+            .gather()
+            .into_iter()
+            .map(|family| family.name().to_string())
+            .collect::<Vec<_>>();
+        assert!(
+            metric_names
+                .iter()
+                .any(|name| name == "dynamo_frontend_prefill_worker_assigned_requests")
+        );
+        assert!(metric_names.iter().any(|name| {
+            name == "dynamo_frontend_prefill_worker_assigned_input_tokens"
+        }));
     }
 
     #[test]

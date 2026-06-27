@@ -22,7 +22,8 @@ use super::metrics::register_worker_timing_metrics;
 use crate::discovery::ModelManager;
 use crate::endpoint_type::EndpointType;
 use crate::kv_router::metrics::{
-    RoutingOverheadMetrics, register_router_queue_metrics, register_worker_load_metrics,
+    RoutingOverheadMetrics, register_prefill_assignment_metrics, register_router_queue_metrics,
+    register_worker_load_metrics,
 };
 use crate::request_template::RequestTemplate;
 use anyhow::Result;
@@ -888,6 +889,11 @@ impl HttpServiceConfigBuilder {
         // These are updated by KvWorkerMonitor when receiving ActiveLoad events
         if let Err(e) = register_worker_load_metrics(&registry) {
             tracing::warn!("Failed to register worker load metrics: {}", e);
+        }
+
+        // Register policy-independent per-prefill-worker assignment counters.
+        if let Err(e) = register_prefill_assignment_metrics(&registry) {
+            tracing::warn!("Failed to register prefill assignment metrics: {}", e);
         }
 
         // Register worker timing metrics (last_ttft, last_itl per worker)
