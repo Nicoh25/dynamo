@@ -45,7 +45,6 @@ _KV_ROUTER_FIELDS: tuple[str, ...] = (
     "router_ttl_secs",
     "router_queue_threshold",
     "router_policy_config",
-    "router_worker_selection_policy",
     "router_event_threads",
     "router_queue_policy",
     "use_remote_indexer",
@@ -129,7 +128,6 @@ class KvRouterConfigBase(ConfigBase):
     router_ttl_secs: float
     router_queue_threshold: Optional[float]
     router_policy_config: Optional[str] = None
-    router_worker_selection_policy: str = "default"
     router_event_threads: int
     router_queue_policy: str
     use_remote_indexer: bool = False
@@ -417,20 +415,6 @@ class KvRouterArgGroup(ArgGroup):
                 "the existing single default queue."
             ),
             arg_type=str,
-        )
-        add_argument(
-            g,
-            flag_name="--router-worker-selection-policy",
-            env_var="DYN_ROUTER_WORKER_SELECTION_POLICY",
-            default="default",
-            help=(
-                "[EXPERIMENTAL] KV Router: Worker selection policy. "
-                "'default' uses the existing KV cost model. "
-                "'prefill-token-balance' chooses the worker with the lowest "
-                "projected active prefill tokens."
-            ),
-            arg_type=str,
-            choices=["default", "prefill-token-balance"],
         )
         add_argument(
             g,

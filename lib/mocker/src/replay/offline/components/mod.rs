@@ -16,4 +16,4 @@ pub use types::TrafficStats;
 pub(in crate::replay::offline) use types::{
     EngineEffects, EnginePassMode, ReadyArrival, ScheduledWorkerCompletion, TrafficAccumulator,
 };
-pub(crate) use types::{RouterEffects, ShadowSelection, WorkerAdmission};
+pub(crate) use types::{RouterEffects, WorkerAdmission};

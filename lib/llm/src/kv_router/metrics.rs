@@ -376,9 +376,7 @@ pub fn register_prefill_assignment_metrics(
 ) -> Result<(), prometheus::Error> {
     let metrics = &*PREFILL_ASSIGNMENT_METRICS;
     registry.register(Box::new(metrics.assigned_requests_total.clone()))?;
-    registry.register(Box::new(
-        metrics.assigned_input_tokens_total.clone(),
-    ))?;
+    registry.register(Box::new(metrics.assigned_input_tokens_total.clone()))?;
     Ok(())
 }
 
@@ -938,6 +936,7 @@ dynamo_frontend_worker_active_prefill_tokens{dp_rank=\"0\",worker_id=\"123\",wor
     fn test_register_prefill_assignment_metrics() {
         let registry = prometheus::Registry::new();
         register_prefill_assignment_metrics(&registry).unwrap();
+        PREFILL_ASSIGNMENT_METRICS.observe(999, None, 1);
 
         let metric_names = registry
             .gather()
@@ -947,11 +946,13 @@ dynamo_frontend_worker_active_prefill_tokens{dp_rank=\"0\",worker_id=\"123\",wor
         assert!(
             metric_names
                 .iter()
-                .any(|name| name == "dynamo_frontend_prefill_worker_assigned_requests")
+                .any(|name| name == "dynamo_frontend_prefill_worker_assigned_requests_total")
         );
-        assert!(metric_names.iter().any(|name| {
-            name == "dynamo_frontend_prefill_worker_assigned_input_tokens"
-        }));
+        assert!(
+            metric_names.iter().any(|name| {
+                name == "dynamo_frontend_prefill_worker_assigned_input_tokens_total"
+            })
+        );
     }
 
     #[test]

@@ -106,7 +106,6 @@ pub fn kv_router_config_from_dynamo_env() -> KvRouterConfig {
         router_track_prefill_tokens = config.router_track_prefill_tokens,
         router_queue_threshold = ?config.router_queue_threshold,
         router_policy_config = ?config.router_policy_config,
-        router_worker_selection_policy = %config.router_worker_selection_policy,
         router_predicted_ttl_secs = ?config.router_predicted_ttl_secs,
         "KvRouterConfig initialized (DYN_* env overrides applied)"
     );
@@ -174,11 +173,6 @@ fn kv_router_config_from_lookup(get_env: impl Fn(&str) -> Option<String>) -> KvR
     }
     if let Some(value) = get_env("DYN_ROUTER_POLICY_CONFIG") {
         config.router_policy_config = Some(value);
-    }
-    if let Some(value) = get_env("DYN_ROUTER_WORKER_SELECTION_POLICY")
-        .and_then(|value| value.parse::<RouterWorkerSelectionPolicy>().ok())
-    {
-        config.router_worker_selection_policy = value;
     }
     if let Some(value) = parse_f64(&get_env, "DYN_ROUTER_PREDICTED_TTL_SECS") {
         config.router_predicted_ttl_secs = Some(value);
@@ -300,38 +294,6 @@ impl RouterPrefillLoadModel {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub enum RouterWorkerSelectionPolicy {
-    #[default]
-    #[serde(rename = "default")]
-    Default,
-    #[serde(rename = "prefill-token-balance")]
-    PrefillTokenBalance,
-}
-
-impl fmt::Display for RouterWorkerSelectionPolicy {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Default => f.write_str("default"),
-            Self::PrefillTokenBalance => f.write_str("prefill-token-balance"),
-        }
-    }
-}
-
-impl FromStr for RouterWorkerSelectionPolicy {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "default" => Ok(Self::Default),
-            "prefill-token-balance" => Ok(Self::PrefillTokenBalance),
-            _ => Err(format!(
-                "unknown router worker selection policy: {s:?}, expected 'default' or 'prefill-token-balance'"
-            )),
-        }
-    }
-}
-
 impl FromStr for RouterQueuePolicy {
     type Err = String;
 
@@ -443,7 +405,6 @@ struct KvRouterConfigSerde {
     router_event_threads: u32,
     skip_initial_worker_wait: bool,
     router_queue_policy: RouterQueuePolicy,
-    router_worker_selection_policy: RouterWorkerSelectionPolicy,
     use_remote_indexer: bool,
     serve_indexer: bool,
     shared_cache_multiplier: f64,
@@ -478,7 +439,6 @@ impl Default for KvRouterConfigSerde {
             router_event_threads: config.router_event_threads,
             skip_initial_worker_wait: config.skip_initial_worker_wait,
             router_queue_policy: config.router_queue_policy,
-            router_worker_selection_policy: config.router_worker_selection_policy,
             use_remote_indexer: config.use_remote_indexer,
             serve_indexer: config.serve_indexer,
             shared_cache_multiplier: config.shared_cache_multiplier,
@@ -596,11 +556,6 @@ pub struct KvRouterConfig {
     /// "wspt": weighted shortest processing time (Smith's rule) — optimizes average TTFT.
     pub router_queue_policy: RouterQueuePolicy,
 
-    /// Worker scoring policy for KV routing. "default" uses the existing KV
-    /// cost model. "prefill-token-balance" is an experimental DEP prefill
-    /// policy that minimizes projected active prefill tokens.
-    pub router_worker_selection_policy: RouterWorkerSelectionPolicy,
-
     /// Whether to query a remote KV indexer served from the worker component
     /// instead of maintaining a local radix tree for overlap scoring.
     #[serde(default)]
@@ -660,7 +615,6 @@ impl Default for KvRouterConfig {
             router_event_threads: 4,
             skip_initial_worker_wait: false,
             router_queue_policy: RouterQueuePolicy::default(),
-            router_worker_selection_policy: RouterWorkerSelectionPolicy::default(),
             use_remote_indexer: false,
             serve_indexer: false,
             shared_cache_multiplier: 0.0,
@@ -710,7 +664,6 @@ impl TryFrom<KvRouterConfigSerde> for KvRouterConfig {
             router_event_threads: compat.router_event_threads,
             skip_initial_worker_wait: compat.skip_initial_worker_wait,
             router_queue_policy: compat.router_queue_policy,
-            router_worker_selection_policy: compat.router_worker_selection_policy,
             use_remote_indexer: compat.use_remote_indexer,
             serve_indexer: compat.serve_indexer,
             shared_cache_multiplier: compat.shared_cache_multiplier,
@@ -922,10 +875,6 @@ mod tests {
             ("DYN_ROUTER_TRACK_OUTPUT_BLOCKS", "on"),
             ("DYN_ROUTER_TRACK_PREFILL_TOKENS", "false"),
             ("DYN_ROUTER_QUEUE_THRESHOLD", "4.5"),
-            (
-                "DYN_ROUTER_WORKER_SELECTION_POLICY",
-                "prefill-token-balance",
-            ),
         ]);
 
         assert_eq!(config.overlap_score_credit, 0.25);
@@ -938,10 +887,6 @@ mod tests {
         assert!(config.router_track_output_blocks);
         assert!(!config.router_track_prefill_tokens);
         assert_eq!(config.router_queue_threshold, Some(4.5));
-        assert_eq!(
-            config.router_worker_selection_policy,
-            RouterWorkerSelectionPolicy::PrefillTokenBalance
-        );
 
         let predicted = config_from_values(&[("DYN_ROUTER_PREDICTED_TTL_SECS", "60")]);
         assert_eq!(predicted.router_predicted_ttl_secs, Some(60.0));
@@ -1115,34 +1060,6 @@ mod tests {
             config.router_policy_config.as_deref(),
             Some(policy_file.path().to_str().unwrap())
         );
-    }
-
-    #[test]
-    fn test_kv_router_config_deserializes_worker_selection_policy() {
-        let config: KvRouterConfig =
-            serde_json::from_str(r#"{"router_worker_selection_policy":"prefill-token-balance"}"#)
-                .unwrap();
-
-        assert_eq!(
-            config.router_worker_selection_policy,
-            RouterWorkerSelectionPolicy::PrefillTokenBalance
-        );
-        assert_eq!(
-            config.router_worker_selection_policy.to_string(),
-            "prefill-token-balance"
-        );
-    }
-
-    #[test]
-    fn test_kv_router_config_rejects_invalid_worker_selection_policy() {
-        let error = serde_json::from_str::<KvRouterConfig>(
-            r#"{"router_worker_selection_policy":"not-a-policy"}"#,
-        )
-        .unwrap_err()
-        .to_string();
-
-        assert!(error.contains("not-a-policy"), "{error}");
-        assert!(error.contains("prefill-token-balance"), "{error}");
     }
 
     #[test]

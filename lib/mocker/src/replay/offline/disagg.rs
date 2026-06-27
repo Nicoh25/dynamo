@@ -721,7 +721,6 @@ impl DisaggRuntime {
             worker_idx,
             overlap_blocks,
             isl_blocks,
-            shadow,
         } in admissions
         {
             self.traffic.on_admission(overlap_blocks, isl_blocks);
@@ -730,9 +729,6 @@ impl DisaggRuntime {
                 (overlap_blocks as usize * self.prefill_block_size).min(input_tokens);
             self.collector
                 .on_prefill_route_overlap(uuid, overlap_tokens);
-            if let Some(shadow) = shadow {
-                self.collector.on_prefill_shadow_selection(uuid, shadow);
-            }
             if self.state(uuid)?.phase != DisaggPhase::QueuedPrefill {
                 bail!("offline disagg replay expected queued prefill request for {uuid}");
             }

@@ -280,46 +280,6 @@ def test_replay_cli_subprocess_trace_disagg_smoke(tmp_path):
 
 
 @pytest.mark.timeout(30)
-def test_replay_cli_shadow_policy_emits_per_request_diagnostics(tmp_path):
-    trace_path = _write_cli_smoke_trace(tmp_path)
-    report_path = tmp_path / "trace_shadow_report.json"
-    report_jsonl = tmp_path / "trace_shadow_requests.jsonl"
-
-    completed = _run_replay_cli(
-        tmp_path,
-        str(trace_path),
-        "--replay-mode",
-        "offline",
-        "--router-mode",
-        "kv_router",
-        "--num-prefill-workers",
-        "2",
-        "--num-decode-workers",
-        "2",
-        "--report-json",
-        str(report_path),
-        "--report-jsonl",
-        str(report_jsonl),
-        "--shadow-router-worker-selection-policy",
-        "prefill-token-balance",
-        "--router-config",
-        '{"router_worker_selection_policy":"default","router_temperature":0}',
-        "--prefill-engine-args",
-        '{"block_size":64,"speedup_ratio":1000.0,"worker_type":"prefill"}',
-        "--decode-engine-args",
-        '{"block_size":64,"speedup_ratio":1000.0,"worker_type":"decode"}',
-    )
-
-    _assert_replay_cli_outputs(completed, report_path)
-    rows = [json.loads(line) for line in report_jsonl.read_text().splitlines()]
-    assert rows
-    assert all(row["prefill_primary_policy"] == "default" for row in rows)
-    assert all(row["prefill_shadow_policy"] == "prefill-token-balance" for row in rows)
-    assert all(row["prefill_primary_tie_count"] is not None for row in rows)
-    assert all(row["prefill_shadow_tie_count"] is not None for row in rows)
-
-
-@pytest.mark.timeout(30)
 def test_replay_cli_subprocess_multiturn_trace_smoke(tmp_path):
     trace_path = _write_multiturn_trace(tmp_path)
     report_path = tmp_path / "multiturn_trace_report.json"

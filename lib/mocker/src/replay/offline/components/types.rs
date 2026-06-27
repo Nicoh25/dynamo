@@ -2,7 +2,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use dynamo_kv_router::protocols::RouterEvent;
-use dynamo_kv_router::config::RouterWorkerSelectionPolicy;
 use uuid::Uuid;
 
 use super::super::runtime_utils::WorkerCompletionPayload;
@@ -23,15 +22,6 @@ pub(in crate::replay::offline) enum EnginePassMode {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct ShadowSelection {
-    pub(crate) primary_policy: RouterWorkerSelectionPolicy,
-    pub(crate) primary_tie_count: Option<usize>,
-    pub(crate) shadow_policy: RouterWorkerSelectionPolicy,
-    pub(crate) shadow_worker_idx: usize,
-    pub(crate) shadow_tie_count: Option<usize>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct WorkerAdmission {
     pub(crate) uuid: Uuid,
     pub(crate) worker_idx: usize,
@@ -42,10 +32,6 @@ pub(crate) struct WorkerAdmission {
     /// Total ISL expressed in blocks (ceil(isl_tokens / block_size)),
     /// paired with ``overlap_blocks`` for the hit-rate ratio.
     pub(crate) isl_blocks: u32,
-    /// Counterfactual selection made against the exact same pre-admission
-    /// scheduler state. Present only when offline shadow policy diagnostics are
-    /// enabled for the prefill router.
-    pub(crate) shadow: Option<ShadowSelection>,
 }
 
 #[derive(Debug)]

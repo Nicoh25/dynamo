@@ -7,8 +7,6 @@ use serde::ser::{SerializeMap, Serializer};
 use std::fmt::{Display, Formatter, Result as FmtResult};
 use uuid::Uuid;
 
-use super::offline::components::ShadowSelection;
-
 #[derive(Debug, Clone)]
 pub struct TraceSimulationReport {
     pub request_counts: TraceRequestCounts,
@@ -339,7 +337,6 @@ struct TraceRequestStats {
     /// Downstream tooling derives "was_bypassed" as `prefill_worker_idx is None`
     /// in disagg mode.
     prefill_worker_idx: Option<usize>,
-    prefill_shadow: Option<ShadowSelection>,
     /// Index of the decode worker that handled this request, if any.
     decode_worker_idx: Option<usize>,
     /// Session / turn metadata copied from the workload driver, when the
@@ -403,11 +400,6 @@ pub struct PerRequestRecord {
     pub output_length: usize,
     pub reused_input_tokens: usize,
     pub prefill_worker_idx: Option<usize>,
-    pub prefill_primary_policy: Option<String>,
-    pub prefill_primary_tie_count: Option<usize>,
-    pub prefill_shadow_policy: Option<String>,
-    pub prefill_shadow_worker_idx: Option<usize>,
-    pub prefill_shadow_tie_count: Option<usize>,
     pub decode_worker_idx: Option<usize>,
     pub prefill_admit_ms: Option<f64>,
     pub source_held_ms: Option<f64>,
@@ -600,7 +592,6 @@ impl TraceCollector {
                 output_length,
                 reused_input_tokens: 0,
                 prefill_worker_idx: None,
-                prefill_shadow: None,
                 decode_worker_idx: None,
                 session_id: None,
                 turn_index: None,
@@ -642,12 +633,6 @@ impl TraceCollector {
             && stats.prefill_worker_idx.is_none()
         {
             stats.prefill_worker_idx = Some(worker_idx);
-        }
-    }
-
-    pub(crate) fn on_prefill_shadow_selection(&mut self, uuid: Uuid, shadow: ShadowSelection) {
-        if let Some(stats) = self.requests.get_mut(&uuid) {
-            stats.prefill_shadow = Some(shadow);
         }
     }
 
@@ -957,21 +942,6 @@ impl TraceCollector {
                     .prefill_reused_input_tokens
                     .unwrap_or(stats.reused_input_tokens),
                 prefill_worker_idx: stats.prefill_worker_idx,
-                prefill_primary_policy: stats
-                    .prefill_shadow
-                    .map(|shadow| shadow.primary_policy.to_string()),
-                prefill_primary_tie_count: stats
-                    .prefill_shadow
-                    .and_then(|shadow| shadow.primary_tie_count),
-                prefill_shadow_policy: stats
-                    .prefill_shadow
-                    .map(|shadow| shadow.shadow_policy.to_string()),
-                prefill_shadow_worker_idx: stats
-                    .prefill_shadow
-                    .map(|shadow| shadow.shadow_worker_idx),
-                prefill_shadow_tie_count: stats
-                    .prefill_shadow
-                    .and_then(|shadow| shadow.shadow_tie_count),
                 decode_worker_idx: stats.decode_worker_idx,
                 prefill_admit_ms: detail.prefill_admit_ms,
                 source_held_ms: detail.source_held_ms,
@@ -1108,7 +1078,6 @@ fn std_dev(values: &[f64]) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dynamo_kv_router::config::RouterWorkerSelectionPolicy;
 
     fn build_distribution_stats_sorted(values: &[f64]) -> TraceDistributionStats {
         if values.is_empty() {
@@ -1178,16 +1147,6 @@ mod tests {
         collector.on_decode_route_overlap(uuid, 32);
         collector.on_decode_admit(uuid, 25.0, 40);
         collector.on_prefill_assigned(uuid, 2);
-        collector.on_prefill_shadow_selection(
-            uuid,
-            ShadowSelection {
-                primary_policy: RouterWorkerSelectionPolicy::Default,
-                primary_tie_count: Some(1),
-                shadow_policy: RouterWorkerSelectionPolicy::PrefillTokenBalance,
-                shadow_worker_idx: 3,
-                shadow_tie_count: Some(1),
-            },
-        );
         collector.on_decode_assigned(uuid, 7);
         collector.on_token(uuid, 50.0);
         collector.on_token(uuid, 60.0);
@@ -1212,14 +1171,6 @@ mod tests {
         assert_eq!(rec.output_length, 4);
         assert_eq!(rec.reused_input_tokens, 30);
         assert_eq!(rec.prefill_worker_idx, Some(2));
-        assert_eq!(rec.prefill_primary_policy.as_deref(), Some("default"));
-        assert_eq!(rec.prefill_primary_tie_count, Some(1));
-        assert_eq!(
-            rec.prefill_shadow_policy.as_deref(),
-            Some("prefill-token-balance")
-        );
-        assert_eq!(rec.prefill_shadow_worker_idx, Some(3));
-        assert_eq!(rec.prefill_shadow_tie_count, Some(1));
         assert_eq!(rec.decode_worker_idx, Some(7));
         assert_eq!(rec.prefill_admit_ms, Some(5.0));
         assert_eq!(rec.source_held_ms, Some(10.0));

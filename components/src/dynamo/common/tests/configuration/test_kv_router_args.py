@@ -262,57 +262,6 @@ def test_load_aware_env_applies_no_cache_load_balancing_preset(monkeypatch) -> N
     assert kwargs["router_track_prefill_tokens"] is True
 
 
-def test_worker_selection_policy_cli_flows_to_kv_router_kwargs() -> None:
-    parser = argparse.ArgumentParser()
-    KvRouterArgGroup().add_arguments(parser)
-
-    args = parser.parse_args(
-        ["--router-worker-selection-policy", "prefill-token-balance"]
-    )
-
-    config = KvRouterConfigBase.from_cli_args(args)
-    assert (
-        config.kv_router_kwargs()["router_worker_selection_policy"]
-        == "prefill-token-balance"
-    )
-
-
-def test_worker_selection_policy_env_flows_to_kv_router_kwargs(monkeypatch) -> None:
-    monkeypatch.setenv(
-        "DYN_ROUTER_WORKER_SELECTION_POLICY", "prefill-token-balance"
-    )
-    parser = argparse.ArgumentParser()
-    KvRouterArgGroup().add_arguments(parser)
-
-    args = parser.parse_args([])
-
-    config = KvRouterConfigBase.from_cli_args(args)
-    assert (
-        config.kv_router_kwargs()["router_worker_selection_policy"]
-        == "prefill-token-balance"
-    )
-
-
-def test_load_aware_preserves_worker_selection_policy() -> None:
-    parser = argparse.ArgumentParser()
-    KvRouterArgGroup().add_arguments(parser)
-
-    args = parser.parse_args(
-        [
-            "--load-aware",
-            "--router-worker-selection-policy",
-            "prefill-token-balance",
-        ]
-    )
-
-    config = KvRouterConfigBase.from_cli_args(args)
-    kwargs = config.kv_router_kwargs()
-
-    assert kwargs["overlap_score_credit"] == 0.0
-    assert kwargs["router_track_prefill_tokens"] is True
-    assert kwargs["router_worker_selection_policy"] == "prefill-token-balance"
-
-
 def test_load_aware_preserves_prefill_load_scale() -> None:
     parser = argparse.ArgumentParser()
     KvRouterArgGroup().add_arguments(parser)

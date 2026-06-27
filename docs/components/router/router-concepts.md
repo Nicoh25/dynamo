@@ -59,19 +59,6 @@ For the flags that enable these models, see [Configuration and Tuning](router-co
 
 The router selects the worker with the lowest cost. When `router_temperature` is set to a non-zero value, the router uses softmax sampling on the normalized cost logits to introduce randomness in the selection, which can help with load distribution.
 
-By default, KV routing uses the cache/decode cost model described above. The
-experimental `prefill-token-balance` worker-selection policy keeps the same KV
-router integration point and candidate filters, but scores workers only by
-projected prefill-token load:
-
-```text
-score = active_prefill_tokens(worker) + effective_prefill_tokens(incoming_isl, cached_tokens_for_worker)
-```
-
-This policy is intended for homogeneous DEP prefill experiments where the goal
-is to reduce per-rank prefill-token skew independently from decode load and
-broader GPU scheduling effects.
-
 Before scoring, the router filters candidates by request allow-lists, exact pins, DP-rank bounds, required taints, and busy-threshold overload state. For those hard eligibility rules, see [Router Filtering](router-filtering.md).
 
 When requests wait in policy-class queues, weighted
