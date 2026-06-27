@@ -3,11 +3,8 @@
 
 """Unit tests for dynamo.vllm.multimodal_utils.serialized_custom_encoder.
 
-SerializedCustomEncoder is the safe default: the subclass writes a synchronous
-``_encode_blocking`` and the base runs it via asyncio.to_thread under an
-internal lock. These tests pin that encode returns the blocking result, that
-concurrent encode calls are serialized (one forward at a time), and that the
-class stays abstract.
+Pin that encode returns the blocking result, that concurrent encode calls are
+serialized (one forward at a time), and that the class stays abstract.
 """
 
 import asyncio

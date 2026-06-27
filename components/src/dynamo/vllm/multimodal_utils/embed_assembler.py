@@ -3,28 +3,24 @@
 
 """Mixed token-ids/embeds assembly for the aggregated CustomEncoder path.
 
-The encoder returns only the visual token embeddings; this module builds the
+The encoder returns only the visual-token embeddings; this module builds the
 inputs for vLLM's mixed ``EmbedsPrompt`` mode (``prompt_token_ids`` +
-``prompt_is_token_ids`` + ``prompt_embeds``):
+``prompt_is_token_ids`` + ``prompt_embeds``). vLLM embeds the ``True`` (text)
+positions itself and substitutes the ``False`` (image) positions from
+``prompt_embeds``, so Dynamo fills only the image rows (text rows stay zero):
 
-    prompt_token_ids   = [ text ... <img run> ... text ... ]
+    prompt_token_ids    = [ text ... <img run> ... text ... ]
     prompt_is_token_ids = [ True ...  False    ... True ... ]
     prompt_embeds       = [ zeros... img_embeds... zeros... ]   (seq_len, hidden)
 
-vLLM embeds the ``True`` (text) positions itself with the model's real
-embedding table and substitutes the ``False`` (image) positions from
-``prompt_embeds`` in the forward pass.  Dynamo therefore only fills the image
-rows — text rows stay zero (they are overwritten) and no LM embedding weight is
-needed on the Dynamo side.
-
-The contract is **one placeholder token per image**: each occurrence of the
-placeholder token in ``prompt_token_ids`` is one image slot, matched
-positionally to the encoder tensors, and the single placeholder is expanded to
-the tensor's row count so the encoder dictates the span length (mirroring
-vLLM's own placeholder expansion); this keeps a mismatch between the tokenizer's
-placeholder count and the encoder's visual-token count from raising.  The chat
-template therefore emits exactly one placeholder token per image and needs no
-separator between consecutive images.
+The contract is **one placeholder token per image**: each placeholder in
+``prompt_token_ids`` is one image (matched positionally to the encoder tensors)
+and is expanded to that tensor's row count — i.e. the number of visual tokens
+the encoder produced for the image. E.g. a single placeholder ``P`` with a
+``(3, hidden)`` image tensor expands ``[t, P, t]`` → ``[t, P, P, P, t]``, so the
+encoder dictates the span length (mirroring vLLM's own placeholder expansion).
+The chat template emits exactly one placeholder per image, with no separator
+between consecutive images.
 """
 
 from __future__ import annotations
@@ -73,8 +69,8 @@ def build_mixed_embeds(
             f"in sequence of length {len(token_ids)}"
         )
 
-    # Check tensor 0 is 2D before reading its hidden dim, so a 1D encoder output
-    # raises a clear ValueError here instead of an opaque IndexError on shape[1].
+    # Check 2D before reading shape[1], so a 1D encoder output raises a clear
+    # ValueError here instead of an opaque IndexError.
     if img_tensors[0].dim() != 2:
         raise ValueError(
             f"image tensor 0 has shape {tuple(img_tensors[0].shape)}; expected "
@@ -82,29 +78,25 @@ def build_mixed_embeds(
         )
     hidden = img_tensors[0].shape[1]
     dtype = img_tensors[0].dtype
-    # Validate shapes before scattering so a bad encoder output raises a clear
-    # ValueError here (caught by the caller) instead of an opaque RuntimeError
-    # from the row-copy below on a width mismatch.
+    # Validate all shapes before scattering, so a width mismatch raises a clear
+    # ValueError here instead of an opaque RuntimeError in the row-copy below.
     for i, tensor in enumerate(img_tensors):
         if tensor.dim() != 2 or tensor.shape[1] != hidden:
             raise ValueError(
                 f"image tensor {i} has shape {tuple(tensor.shape)}; expected "
                 f"2D with hidden dim {hidden} (from image tensor 0)"
             )
-        # A (0, hidden) tensor passes the 2D/hidden checks but would erase the
-        # image's placeholder token entirely, silently dropping the image from
-        # the prompt. An encoder returning no visual tokens for an image is a
-        # bug — fail loudly instead.
+        # A (0, hidden) tensor would erase the image's placeholder run entirely,
+        # silently dropping the image — an encoder bug, so fail loudly.
         if tensor.shape[0] == 0:
             raise ValueError(
                 f"image tensor {i} has 0 rows (shape {tuple(tensor.shape)}); the "
                 "encoder returned no visual tokens for an image"
             )
 
-    # Build the token-id / mask layout and record where each image block lands,
+    # Build the token-id / mask layout, recording where each image block lands,
     # then scatter the image rows into one pre-zeroed (seq_len, hidden) buffer.
-    # Text rows stay zero (vLLM overwrites them via the model's embedding table),
-    # so there is no need to allocate per-text-segment zero tensors and concat.
+    # Text rows stay zero (vLLM overwrites them via the embedding table).
     out_token_ids: list[int] = []
     is_token_ids: list[bool] = []
     image_slots: list[tuple[int, torch.Tensor]] = []  # (row_start, tensor)

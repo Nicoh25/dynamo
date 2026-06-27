@@ -3,12 +3,9 @@
 
 """Unit tests for dynamo.vllm.multimodal_utils.embed_assembler.
 
-build_mixed_embeds assembles the mixed token-ids/embeds EmbedsPrompt for the
-aggregated CustomEncoder path: each placeholder token is expanded to its encoder
-tensor's row count, image rows carry the encoder embeddings, and text rows stay
-zero (vLLM fills them from the model's embedding table). These tests pin that
-layout, the per-image expansion (including back-to-back images), and the input
-validation that surfaces a bad encoder output as a clear ValueError.
+Pin the mixed-prompt layout, the per-image placeholder expansion (including
+back-to-back images), and the input validation that surfaces a bad encoder
+output as a clear ValueError.
 """
 
 import pytest

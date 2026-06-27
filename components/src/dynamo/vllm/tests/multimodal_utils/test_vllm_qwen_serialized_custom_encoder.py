@@ -3,13 +3,9 @@
 
 """Unit tests for dynamo.vllm.multimodal_utils.qwen_serialized_custom_encoder.
 
-QwenSerializedCustomEncoder is a serial (SerializedCustomEncoder) base that
-implements get_image_placeholder_token_id by resolving the Qwen image
-placeholder token string against the model tokenizer (assigned by the subclass
-in load()). These tests pin the preset string, per-version id resolution (151655
-for Qwen3-VL, 248056 for Qwen3.5 — why the tokenizer is authoritative rather
-than a static id table), the fail-fast errors (unset tokenizer, token the
-tokenizer does not define), and that the class stays abstract.
+Pin the preset placeholder string, per-version id resolution from the tokenizer
+(151655 Qwen3-VL, 248056 Qwen3.5), the fail-fast errors (unset tokenizer, token
+the tokenizer does not define), and that the class stays abstract.
 """
 
 from typing import List

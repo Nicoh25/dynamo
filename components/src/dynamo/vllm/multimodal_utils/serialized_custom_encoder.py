@@ -3,15 +3,11 @@
 
 """Serial, off-loop default base for the pluggable CustomEncoder path.
 
-The safe default for the 90% case: implement a *synchronous* forward in
-``_encode_blocking`` and this base provides ``encode`` for you. ``encode`` runs
-the forward via ``asyncio.to_thread`` (so the event loop stays responsive) under
-an internal ``asyncio.Lock`` (so concurrent requests are serialized — one
-forward at a time, bounded memory, and ``_encode_blocking`` need not be
-re-entrant).
-
-Subclass this unless you intend to run your own batching scheduler; in that
-case subclass ``CustomEncoder`` and implement async ``encode`` directly.
+Implement a synchronous ``_encode_blocking`` and this base provides ``encode``:
+it runs the forward via ``asyncio.to_thread`` (keeping the event loop
+responsive) under an internal lock (so concurrent requests are serialized — one
+forward at a time, and ``_encode_blocking`` need not be re-entrant). Subclass
+this unless you intend to run your own batching scheduler.
 """
 
 from __future__ import annotations
@@ -28,22 +24,14 @@ from dynamo.vllm.multimodal_utils.custom_encoder import CustomEncoder
 class SerializedCustomEncoder(CustomEncoder):
     """CustomEncoder base that runs a synchronous forward serially, off-loop.
 
-    Implements ``encode`` by running ``_encode_blocking`` in a worker thread
-    (``asyncio.to_thread``) under an internal lock, so:
-
-    - the event loop is never blocked by the forward, and
-    - concurrent ``encode`` calls are serialized (one forward at a time), so
-      ``_encode_blocking`` is plain single-threaded code — no re-entrancy
-      needed — and peak memory is bounded to a single forward.
-
     Subclasses implement ``load``, ``get_image_placeholder_token_id``, and the
-    synchronous ``_encode_blocking``.
+    synchronous ``_encode_blocking`` (see the module docstring for the
+    ``encode`` mechanism).
     """
 
     def _serialize_lock(self) -> asyncio.Lock:
-        # Lazily created so subclasses need not call super().__init__(). The
-        # check-and-set has no await between the two statements, so it is atomic
-        # with respect to the single-threaded event loop (no double-create race).
+        # Lazily created (no super().__init__() needed); the check-and-set has no
+        # await between, so it is atomic on the single-threaded event loop.
         lock: Optional[asyncio.Lock] = getattr(self, "_lock", None)
         if lock is None:
             lock = asyncio.Lock()

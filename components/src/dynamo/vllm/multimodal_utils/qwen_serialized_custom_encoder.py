@@ -4,17 +4,9 @@
 """Qwen-family base class for the pluggable CustomEncoder path.
 
 Combines the serial/off-loop default (``SerializedCustomEncoder``) with Qwen
-placeholder-id resolution, so customer encoders for Qwen-family models
-(Qwen2-VL / Qwen3-VL / Qwen3-VL-MoE / Qwen3.5) only implement ``load``
-(assigning ``self.tokenizer``) and the synchronous ``_encode_blocking``::
-
-    from dynamo.vllm.multimodal_utils.qwen_serialized_custom_encoder import (
-        QwenSerializedCustomEncoder,
-    )
-
-    class MyEncoder(QwenSerializedCustomEncoder):
-        def load(self, model_id, device): ...        # set self.tokenizer
-        def _encode_blocking(self, image_urls): ...   # sync forward
+placeholder-id resolution, so encoders for Qwen-family models (Qwen2-VL /
+Qwen3-VL / Qwen3-VL-MoE / Qwen3.5) only implement ``load`` (assigning
+``self.tokenizer``) and the synchronous ``_encode_blocking``.
 """
 
 from __future__ import annotations
@@ -27,11 +19,9 @@ from dynamo.vllm.multimodal_utils.serialized_custom_encoder import (
 )
 
 # Image placeholder token *string* for the Qwen family. The numeric id is always
-# resolved from the encoder's tokenizer (placeholder_token_id_from_tokenizer);
-# the family-specific knowledge is just this string. The same string maps to
-# different ids across Qwen versions (e.g. 151655 for Qwen3-VL vs 248056 for
-# Qwen3.5), which is exactly why the tokenizer — not a static id table — is
-# authoritative.
+# resolved from the encoder's tokenizer — the same string maps to different ids
+# across versions (151655 for Qwen3-VL, 248056 for Qwen3.5), which is why the
+# tokenizer, not a static id table, is authoritative.
 QWEN_IMAGE_PLACEHOLDER_TOKEN = "<|image_pad|>"
 
 
@@ -48,9 +38,7 @@ class QwenSerializedCustomEncoder(SerializedCustomEncoder):
     def get_image_placeholder_token_id(self) -> int:
         """Resolve the Qwen image placeholder id from the model tokenizer.
 
-        The tokenizer is assigned by the subclass in ``load()``. The same
-        ``<|image_pad|>`` string resolves to the per-version id (151655 for
-        Qwen3-VL, 248056 for Qwen3.5), so the tokenizer is authoritative.
+        The tokenizer is assigned by the subclass in ``load()``.
 
         Raises:
             ValueError: if ``self.tokenizer`` is unset, or the tokenizer does
